@@ -1,3 +1,4 @@
+use crate::secrets;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -21,7 +22,12 @@ pub struct Connection {
     pub database: String,
     #[serde(default = "default_user")]
     pub user: String,
-    #[serde(default)]
+    /// Not persisted to disk — the config.json serialization skips this
+    /// field entirely. Passwords live in the OS keychain. Populated in
+    /// memory when (a) the user submits a new value from the UI, or
+    /// (b) `Connection::hydrate_secrets` has pulled it from the keychain
+    /// just before a connect attempt.
+    #[serde(default, skip_serializing)]
     pub password: String,
     #[serde(default)]
     pub ssl: bool,
@@ -29,8 +35,37 @@ pub struct Connection {
     pub readonly: bool,
     #[serde(default)]
     pub color: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Same treatment as `password` — never persisted to disk, since
+    /// connection strings routinely embed `user:pass@host` credentials.
+    #[serde(default, skip_serializing)]
     pub connection_string: Option<String>,
+}
+
+impl Connection {
+    /// Fill `password` and `connection_string` from the OS keychain if they
+    /// aren't already set in memory. Call this right before attempting a
+    /// connect. Any keychain error is logged and the field stays empty;
+    /// the caller will get the usual "auth failed" response from Postgres.
+    pub fn hydrate_secrets(&mut self) {
+        if self.password.is_empty() {
+            match secrets::load_password(&self.name) {
+                Ok(Some(pw)) => self.password = pw,
+                Ok(None) => {}
+                Err(e) => log::warn!("[pg-mcp] keychain read failed for '{}': {}", self.name, e),
+            }
+        }
+        if self.connection_string.is_none() {
+            match secrets::load_connection_string(&self.name) {
+                Ok(Some(cs)) => self.connection_string = Some(cs),
+                Ok(None) => {}
+                Err(e) => log::warn!(
+                    "[pg-mcp] keychain read failed (connstr) for '{}': {}",
+                    self.name,
+                    e
+                ),
+            }
+        }
+    }
 }
 
 fn default_host() -> String {
@@ -81,20 +116,84 @@ impl Config {
 
     pub fn load() -> Self {
         let path = Self::config_path();
-        if path.exists() {
+        let mut cfg = if path.exists() {
             match fs::read_to_string(&path) {
-                Ok(contents) => match serde_json::from_str(&contents) {
-                    Ok(config) => return config,
+                Ok(contents) => match serde_json::from_str::<Config>(&contents) {
+                    Ok(config) => config,
                     Err(e) => {
                         log::warn!("Failed to parse config: {}", e);
+                        Config::default()
                     }
                 },
                 Err(e) => {
                     log::warn!("Failed to read config: {}", e);
+                    Config::default()
+                }
+            }
+        } else {
+            Config::default()
+        };
+
+        // One-shot migration: if the on-disk file still carries plaintext
+        // passwords/connection strings from a pre-keychain build, move
+        // them into the keychain and rewrite the file without the
+        // secrets. If the keychain is unavailable we leave them in place
+        // and let the operator see the warning.
+        if cfg.migrate_plaintext_secrets() {
+            if let Err(e) = cfg.save() {
+                log::warn!("Failed to rewrite config after migration: {}", e);
+            }
+        }
+
+        cfg
+    }
+
+    /// Move any plaintext `password` / `connection_string` values into the
+    /// OS keychain, blanking the in-memory fields so they are not
+    /// re-persisted on the next `save()`. Returns true iff at least one
+    /// field was migrated and the caller should re-save the config.
+    fn migrate_plaintext_secrets(&mut self) -> bool {
+        let mut changed = false;
+        for conn in &mut self.connections {
+            if !conn.password.is_empty() {
+                match secrets::save_password(&conn.name, &conn.password) {
+                    Ok(_) => {
+                        log::info!("[pg-mcp] migrated password for '{}' to keychain", conn.name);
+                        conn.password.clear();
+                        changed = true;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[pg-mcp] keychain unavailable, leaving plaintext password for '{}': {}",
+                            conn.name,
+                            e
+                        );
+                    }
+                }
+            }
+            if let Some(ref cs) = conn.connection_string.clone() {
+                if !cs.is_empty() {
+                    match secrets::save_connection_string(&conn.name, cs) {
+                        Ok(_) => {
+                            log::info!(
+                                "[pg-mcp] migrated connection string for '{}' to keychain",
+                                conn.name
+                            );
+                            conn.connection_string = None;
+                            changed = true;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[pg-mcp] keychain unavailable, leaving plaintext connection string for '{}': {}",
+                                conn.name,
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
-        Config::default()
+        changed
     }
 
     pub fn save(&self) -> Result<(), String> {

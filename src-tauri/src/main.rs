@@ -4,6 +4,7 @@
 mod config;
 mod database;
 mod mcp_server;
+mod secrets;
 
 use config::{Config, Connection, SafeConfig};
 use database::DatabaseManager;
@@ -34,15 +35,27 @@ async fn save_connection(connection: Connection) -> Result<SafeConfig, String> {
         conn.color = config.assign_color();
     }
 
-    // Update existing or insert new
+    // Push secrets into the OS keychain *before* we persist the config,
+    // so a crash between the two only leaves orphan keychain entries, not
+    // a config referencing a missing secret. Empty values from the UI mean
+    // "don't touch the stored secret" — the existing keychain entry stays.
+    if !conn.password.is_empty() {
+        if let Err(e) = secrets::save_password(&conn.name, &conn.password) {
+            return Err(format!("Failed to store password in keychain: {}", e));
+        }
+    }
+    if let Some(ref cs) = conn.connection_string {
+        if !cs.is_empty() {
+            if let Err(e) = secrets::save_connection_string(&conn.name, cs) {
+                return Err(format!("Failed to store connection string in keychain: {}", e));
+            }
+        }
+    }
+    // Never let the plaintext values reach the serialized file.
+    conn.password.clear();
+    conn.connection_string = None;
+
     if let Some(existing) = config.connections.iter_mut().find(|c| c.name == conn.name) {
-        // Preserve password if not provided on edit
-        if conn.password.is_empty() {
-            conn.password = existing.password.clone();
-        }
-        if conn.connection_string.is_none() {
-            conn.connection_string = existing.connection_string.clone();
-        }
         *existing = conn;
     } else {
         config.connections.push(conn);
@@ -67,6 +80,14 @@ async fn delete_connection(name: String) -> Result<SafeConfig, String> {
     }
 
     config.save()?;
+
+    // Best-effort: scrub the keychain too. A failure here is non-fatal —
+    // the connection is already gone from disk and the orphaned keychain
+    // entry is harmless.
+    if let Err(e) = secrets::delete_all(&name) {
+        log::warn!("[pg-mcp] failed to delete keychain entries for '{}': {}", name, e);
+    }
+
     Ok(SafeConfig::from(&config))
 }
 
@@ -90,13 +111,15 @@ async fn set_active(name: String, state: State<'_, AppState>) -> Result<SafeConf
 #[tauri::command]
 async fn test_connection_cmd(name: String) -> Result<String, String> {
     let config = Config::load();
-    let conn = config
+    let mut conn = config
         .connections
         .iter()
         .find(|c| c.name == name)
+        .cloned()
         .ok_or_else(|| format!("Connection '{}' not found", name))?;
 
-    let (version, latency) = DatabaseManager::test_connection(conn).await?;
+    conn.hydrate_secrets();
+    let (version, latency) = DatabaseManager::test_connection(&conn).await?;
     Ok(format!("OK — {} ({}ms)", version, latency))
 }
 

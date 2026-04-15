@@ -332,9 +332,13 @@ impl McpServer {
     }
 
     async fn ensure_connected(&self, config: &Config) -> Result<Connection, String> {
-        let conn = config.get_active_connection()
+        let mut conn = config.get_active_connection()
             .ok_or_else(|| "No active connection.\nOpen the pg-mcp UI and activate a connection, or run:\n  pg-mcp activate <connection-name>".to_string())?
             .clone();
+        // Pull password / connection string out of the OS keychain. If the
+        // keychain is unavailable the fields stay empty and Postgres will
+        // return a normal auth failure.
+        conn.hydrate_secrets();
         let needs_connect = self.db.active_name().await.as_deref() != Some(&conn.name);
         if needs_connect {
             self.db.connect(&conn).await?;
