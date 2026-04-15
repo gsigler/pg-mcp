@@ -24,6 +24,7 @@
   let password = $state("");
   let ssl = $state(false);
   let readonly = $state(true);
+  let redactPii = $state(false);
   let color = $state(COLOR_PALETTE[0]);
   let localTestResult = $state(null);
 
@@ -45,6 +46,7 @@
       user = conn.user;
       ssl = conn.ssl;
       readonly = conn.readonly;
+      redactPii = conn.redactPii ?? false;
       color = conn.color || COLOR_PALETTE[0];
       connectionString = conn.connectionString || "";
     } catch (e) {
@@ -62,6 +64,7 @@
       password,
       ssl,
       readonly,
+      redactPii,
       color,
       connectionString: connectionString.trim() || null,
     };
@@ -177,6 +180,7 @@
     <div class="toggle-row">
       <Toggle label="SSL" bind:checked={ssl} />
       <Toggle label="Read-only" bind:checked={readonly} />
+      <Toggle label="Redact PII" bind:checked={redactPii} />
     </div>
 
     {#if displayTestResult}

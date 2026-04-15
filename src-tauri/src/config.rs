@@ -33,6 +33,11 @@ pub struct Connection {
     pub ssl: bool,
     #[serde(default = "default_readonly")]
     pub readonly: bool,
+    /// When true, PII in result rows is replaced with `[REDACTED]`
+    /// before the MCP response is sent back — so the LLM on the other
+    /// side of the pipe never sees the raw values.
+    #[serde(default)]
+    pub redact_pii: bool,
     #[serde(default)]
     pub color: String,
     /// Same treatment as `password` — never persisted to disk, since
@@ -262,6 +267,7 @@ pub struct SafeConnection {
     pub password_set: bool,
     pub ssl: bool,
     pub readonly: bool,
+    pub redact_pii: bool,
     pub color: String,
     pub connection_string_set: bool,
 }
@@ -277,6 +283,7 @@ impl From<&Connection> for SafeConnection {
             password_set: !c.password.is_empty(),
             ssl: c.ssl,
             readonly: c.readonly,
+            redact_pii: c.redact_pii,
             color: c.color.clone(),
             connection_string_set: c.connection_string.is_some(),
         }

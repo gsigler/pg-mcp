@@ -4,6 +4,7 @@
 mod config;
 mod database;
 mod mcp_server;
+mod pii;
 mod secrets;
 
 use config::{Config, Connection, SafeConfig};

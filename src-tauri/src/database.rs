@@ -38,6 +38,11 @@ pub struct DatabaseManager {
     active_connection_name: Arc<Mutex<Option<String>>>,
     in_transaction: Arc<Mutex<bool>>,
     query_history: Arc<Mutex<Vec<QueryRecord>>>,
+    /// Snapshot of the active connection's `redact_pii` flag. Captured
+    /// at connect time and consulted when formatting data-path results.
+    /// Introspection paths (describe_table, list_tables, etc.) skip
+    /// redaction regardless — they only return metadata.
+    redact_pii: Arc<Mutex<bool>>,
 }
 
 impl DatabaseManager {
@@ -47,6 +52,7 @@ impl DatabaseManager {
             active_connection_name: Arc::new(Mutex::new(None)),
             in_transaction: Arc::new(Mutex::new(false)),
             query_history: Arc::new(Mutex::new(Vec::new())),
+            redact_pii: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -60,6 +66,7 @@ impl DatabaseManager {
         *self.client.lock().await = Some(client);
         *self.active_connection_name.lock().await = Some(conn.name.clone());
         *self.in_transaction.lock().await = false;
+        *self.redact_pii.lock().await = conn.redact_pii;
         Ok(())
     }
 
@@ -67,6 +74,7 @@ impl DatabaseManager {
         *self.client.lock().await = None;
         *self.active_connection_name.lock().await = None;
         *self.in_transaction.lock().await = false;
+        *self.redact_pii.lock().await = false;
     }
 
     async fn get_client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Client>>, String> {
@@ -121,6 +129,7 @@ impl DatabaseManager {
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<String, String> {
         let start = Instant::now();
+        let redact = *self.redact_pii.lock().await;
         let guard = self.get_client().await?;
         let client = guard.as_ref().unwrap();
 
@@ -131,7 +140,7 @@ impl DatabaseManager {
             Ok(rows) => {
                 let row_count = rows.len();
                 self.record_query(sql, duration_ms, Some(row_count), None).await;
-                Ok(format_rows(&rows))
+                Ok(format_rows_opt(&rows, redact))
             }
             Err(e) => {
                 let err = format!("Query error: {}", e);
@@ -157,6 +166,7 @@ impl DatabaseManager {
         expected_max_rows: u64,
     ) -> Result<String, String> {
         let start = Instant::now();
+        let redact = *self.redact_pii.lock().await;
         let guard = self.get_client().await?;
         let client = guard.as_ref().unwrap();
         let in_user_txn = *self.in_transaction.lock().await;
@@ -209,7 +219,7 @@ impl DatabaseManager {
                         .map_err(|e| format!("Failed to commit write: {}", e))?;
                     self.record_query(sql, duration_ms, Some(row_count as usize), None)
                         .await;
-                    Ok(format_rows(&rows))
+                    Ok(format_rows_opt(&rows, redact))
                 }
             }
             Err(e) => {
@@ -968,7 +978,14 @@ fn literal_sentinel(v: &str) -> Option<&'static str> {
 
 // ─── Row formatting ────────────────────────────────────────────────
 
+/// Format rows for the MCP response. When `redact` is true, PII cells
+/// are replaced with `[REDACTED]` *before* truncation, so partial
+/// content cannot leak via the width-clamp path.
 fn format_rows(rows: &[Row]) -> String {
+    format_rows_opt(rows, false)
+}
+
+fn format_rows_opt(rows: &[Row], redact: bool) -> String {
     if rows.is_empty() {
         return "(0 rows)\n".to_string();
     }
@@ -980,7 +997,12 @@ fn format_rows(rows: &[Row]) -> String {
     for row in rows.iter().take(MAX_RESULT_ROWS) {
         let mut row_data = Vec::new();
         for (i, col) in columns.iter().enumerate() {
-            let val = get_cell_string(row, i, col.type_());
+            let raw = get_cell_string(row, i, col.type_());
+            let val = if redact {
+                crate::pii::redact(col.name(), &raw)
+            } else {
+                raw
+            };
             let truncated = if val.len() > MAX_COLUMN_WIDTH {
                 format!("{}...", &val[..MAX_COLUMN_WIDTH - 3])
             } else {

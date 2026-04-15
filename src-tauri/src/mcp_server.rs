@@ -326,10 +326,15 @@ impl McpServer {
     fn connection_banner(conn: &Connection) -> String {
         let mode = if conn.readonly { "\u{1f512} READ-ONLY" } else { "\u{1f513} READ-WRITE" };
         let bar = "\u{25a0}".repeat(51);
+        let redact_line = if conn.redact_pii {
+            format!("\n\u{25a0} \u{1f576}\u{fe0f}  PII REDACTION ON (values in email/phone/ssn/name-like columns and cells matching PII patterns are returned as [REDACTED])")
+        } else {
+            String::new()
+        };
         format!(
-            "{bar}\n\u{25a0} \u{1f4e6} {name}\n\u{25a0} \u{1f517} {host}:{port}/{db}\n\u{25a0} {mode}\n{bar}\n",
+            "{bar}\n\u{25a0} \u{1f4e6} {name}\n\u{25a0} \u{1f517} {host}:{port}/{db}\n\u{25a0} {mode}{redact}\n{bar}\n",
             bar = bar, name = conn.name, host = conn.host, port = conn.port,
-            db = conn.database, mode = mode,
+            db = conn.database, mode = mode, redact = redact_line,
         )
     }
 
