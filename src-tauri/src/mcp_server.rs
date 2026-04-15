@@ -202,7 +202,7 @@ impl McpServer {
                     },
                     {
                         "name": "update_rows",
-                        "description": "Update rows in a table with structured inputs. Requires a WHERE condition for safety. Returns updated rows via RETURNING *. Requires read-write mode.",
+                        "description": "Update rows in a table with structured inputs. Executes inside a transaction and rolls back automatically if the affected row count exceeds `expected_max_rows`, so a mistyped WHERE cannot silently rewrite the table. Returns updated rows via RETURNING *. Requires read-write mode.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -212,21 +212,23 @@ impl McpServer {
                                     "additionalProperties": { "type": "string" },
                                     "description": "Column-value pairs to set. Use 'NULL', 'NOW()' etc. for special values."
                                 },
-                                "where": { "type": "string", "description": "WHERE condition (required). Use 'TRUE' to update all rows." }
+                                "where": { "type": "string", "description": "WHERE condition (required). Use 'TRUE' to update all rows." },
+                                "expected_max_rows": { "type": "integer", "minimum": 0, "description": "Upper bound on the number of rows this UPDATE should touch. If the actual affected count exceeds this, the transaction is rolled back and an error is returned instead. Commit your intent explicitly — do not pass a very large value 'just in case'." }
                             },
-                            "required": ["table", "set", "where"]
+                            "required": ["table", "set", "where", "expected_max_rows"]
                         }
                     },
                     {
                         "name": "delete_rows",
-                        "description": "Delete rows from a table. Requires a WHERE condition for safety. Returns deleted rows via RETURNING *. Requires read-write mode.",
+                        "description": "Delete rows from a table. Executes inside a transaction and rolls back automatically if the affected row count exceeds `expected_max_rows`, so a mistyped WHERE cannot silently wipe the table. Returns deleted rows via RETURNING *. Requires read-write mode.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "table": { "type": "string", "description": "Target table name" },
-                                "where": { "type": "string", "description": "WHERE condition (required). Use 'TRUE' to delete all rows." }
+                                "where": { "type": "string", "description": "WHERE condition (required). Use 'TRUE' to delete all rows." },
+                                "expected_max_rows": { "type": "integer", "minimum": 0, "description": "Upper bound on the number of rows this DELETE should touch. If the actual affected count exceeds this, the transaction is rolled back and an error is returned instead. Commit your intent explicitly — do not pass a very large value 'just in case'." }
                             },
-                            "required": ["table", "where"]
+                            "required": ["table", "where", "expected_max_rows"]
                         }
                     },
                     {
@@ -464,9 +466,16 @@ impl McpServer {
             set_columns.insert(k.clone(), v.as_str().unwrap_or("NULL").to_string());
         }
         let conditions = args.get("where").and_then(|s| s.as_str()).ok_or("Missing: where")?;
+        let expected_max_rows = args
+            .get("expected_max_rows")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing: expected_max_rows (integer upper bound on affected rows)")?;
 
         let banner = Self::connection_banner(&conn);
-        let result = self.db.update_rows(table, &set_columns, conditions).await?;
+        let result = self
+            .db
+            .update_rows(table, &set_columns, conditions, expected_max_rows)
+            .await?;
         Ok(format!("{}\n{}", banner, result))
     }
 
@@ -478,9 +487,16 @@ impl McpServer {
 
         let table = args.get("table").and_then(|s| s.as_str()).ok_or("Missing: table")?;
         let conditions = args.get("where").and_then(|s| s.as_str()).ok_or("Missing: where")?;
+        let expected_max_rows = args
+            .get("expected_max_rows")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing: expected_max_rows (integer upper bound on affected rows)")?;
 
         let banner = Self::connection_banner(&conn);
-        let result = self.db.delete_rows(table, conditions).await?;
+        let result = self
+            .db
+            .delete_rows(table, conditions, expected_max_rows)
+            .await?;
         Ok(format!("{}\n{}", banner, result))
     }
 

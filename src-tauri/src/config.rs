@@ -196,21 +196,40 @@ impl Config {
         changed
     }
 
+    /// Persist the config to disk atomically: write to a sibling temp
+    /// file, chmod it to 0600 on Unix, then rename over the target. A
+    /// crash between `write` and `rename` leaves the previous config
+    /// intact, rather than the zero-byte file that a non-atomic
+    /// `fs::write` would produce after `O_TRUNC`.
     pub fn save(&self) -> Result<(), String> {
         let path = Self::config_path();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config dir: {}", e))?;
         }
-        let json =
-            serde_json::to_string_pretty(self).map_err(|e| format!("Failed to serialize: {}", e))?;
-        fs::write(&path, &json).map_err(|e| format!("Failed to write config: {}", e))?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize: {}", e))?;
 
+        let tmp = path.with_extension("pgmcp.tmp");
+        fs::write(&tmp, &json)
+            .map_err(|e| format!("Failed to write temp config: {}", e))?;
+
+        // Set perms on the temp file *before* the rename so there is
+        // never a window where the permanent file exists with default
+        // umask permissions.
         #[cfg(unix)]
         {
             let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&path, perms)
-                .map_err(|e| format!("Failed to set permissions: {}", e))?;
+            if let Err(e) = fs::set_permissions(&tmp, perms) {
+                let _ = fs::remove_file(&tmp);
+                return Err(format!("Failed to set permissions: {}", e));
+            }
         }
+
+        fs::rename(&tmp, &path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("Failed to commit config: {}", e)
+        })?;
 
         Ok(())
     }

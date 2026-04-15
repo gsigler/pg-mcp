@@ -141,6 +141,86 @@ impl DatabaseManager {
         }
     }
 
+    /// Execute an UPDATE/DELETE (expected to return rows via RETURNING *)
+    /// inside a transaction or savepoint, and only commit if the affected
+    /// row count is ≤ `expected_max_rows`. If the statement would touch
+    /// more rows than the caller declared, roll back and return an error
+    /// naming the actual count — data is left untouched.
+    ///
+    /// When the caller is already inside a user-managed transaction
+    /// (`begin_transaction`), we use a SAVEPOINT so the outer transaction
+    /// is preserved. Otherwise we open our own BEGIN/COMMIT pair.
+    async fn execute_write_capped(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        expected_max_rows: u64,
+    ) -> Result<String, String> {
+        let start = Instant::now();
+        let guard = self.get_client().await?;
+        let client = guard.as_ref().unwrap();
+        let in_user_txn = *self.in_transaction.lock().await;
+        let savepoint = "pgmcp_write_cap";
+
+        // Open scope
+        let open_res = if in_user_txn {
+            client
+                .batch_execute(&format!("SAVEPOINT {}", savepoint))
+                .await
+        } else {
+            client.batch_execute("BEGIN").await
+        };
+        open_res.map_err(|e| format!("Failed to open write guard: {}", e))?;
+
+        let result = client.query(sql, params).await;
+        let duration_ms = start.elapsed().as_millis();
+
+        let undo_sql = if in_user_txn {
+            format!(
+                "ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp}",
+                sp = savepoint
+            )
+        } else {
+            "ROLLBACK".to_string()
+        };
+        let commit_sql = if in_user_txn {
+            format!("RELEASE SAVEPOINT {}", savepoint)
+        } else {
+            "COMMIT".to_string()
+        };
+
+        match result {
+            Ok(rows) => {
+                let row_count = rows.len() as u64;
+                if row_count > expected_max_rows {
+                    let _ = client.batch_execute(&undo_sql).await;
+                    let err = format!(
+                        "Blocked: statement would affect {} rows, but expected_max_rows = {}. \
+                         No changes were committed. Re-issue the call with \
+                         expected_max_rows >= {} (or tighten the WHERE clause) to proceed.",
+                        row_count, expected_max_rows, row_count
+                    );
+                    self.record_query(sql, duration_ms, None, Some(err.clone())).await;
+                    Err(err)
+                } else {
+                    client
+                        .batch_execute(&commit_sql)
+                        .await
+                        .map_err(|e| format!("Failed to commit write: {}", e))?;
+                    self.record_query(sql, duration_ms, Some(row_count as usize), None)
+                        .await;
+                    Ok(format_rows(&rows))
+                }
+            }
+            Err(e) => {
+                let _ = client.batch_execute(&undo_sql).await;
+                let err = format!("Query error: {}", e);
+                self.record_query(sql, duration_ms, None, Some(err.clone())).await;
+                Err(err)
+            }
+        }
+    }
+
     /// Execute query with pagination support
     pub async fn execute_query_paginated(
         &self,
@@ -273,6 +353,7 @@ impl DatabaseManager {
         table: &str,
         set_columns: &HashMap<String, String>,
         conditions: &str,
+        expected_max_rows: u64,
     ) -> Result<String, String> {
         if set_columns.is_empty() {
             return Err("No columns to update.".into());
@@ -306,13 +387,14 @@ impl DatabaseManager {
             set_parts.join(", "),
             conditions
         );
-        self.execute_parameterized(&sql, &[]).await
+        self.execute_write_capped(&sql, &[], expected_max_rows).await
     }
 
     pub async fn delete_rows(
         &self,
         table: &str,
         conditions: &str,
+        expected_max_rows: u64,
     ) -> Result<String, String> {
         if conditions.trim().is_empty() {
             return Err("WHERE condition is required for safety. Use 'TRUE' to delete all rows.".into());
@@ -323,7 +405,7 @@ impl DatabaseManager {
             "DELETE FROM {}.{} WHERE {} RETURNING *",
             schema_q, tbl_q, conditions
         );
-        self.execute_parameterized(&sql, &[]).await
+        self.execute_write_capped(&sql, &[], expected_max_rows).await
     }
 
     // ─── Explain / dry-run ─────────────────────────────────────────
