@@ -102,13 +102,47 @@ async fn test_connection_cmd(name: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn get_connection_for_edit(name: String) -> Result<Connection, String> {
+    // Never send the plaintext password or full connection string to the
+    // webview. save_connection re-uses the stored password when the
+    // supplied password is empty, so the UI can edit other fields without
+    // re-entering the secret.
     let config = Config::load();
-    config
+    let mut conn = config
         .connections
         .iter()
         .find(|c| c.name == name)
         .cloned()
-        .ok_or_else(|| format!("Connection '{}' not found", name))
+        .ok_or_else(|| format!("Connection '{}' not found", name))?;
+    conn.password.clear();
+    conn.connection_string = None;
+    Ok(conn)
+}
+
+/// Write JSON to disk atomically: write to a temp sibling, then rename.
+/// Prevents corruption if the process dies mid-write.
+fn atomic_write_json(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config dir: {}", e))?;
+    }
+    let tmp = path.with_extension("pgmcp.tmp");
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| format!("Failed to serialize: {}", e))?;
+    std::fs::write(&tmp, json).map_err(|e| format!("Failed to write temp file: {}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to commit config: {}", e))?;
+    Ok(())
+}
+
+/// Decide what key to use for our entry, avoiding clobbering an unrelated
+/// "postgres" MCP the user may already have configured.
+fn pg_mcp_key(existing: Option<&serde_json::Value>, binary: &str) -> String {
+    match existing {
+        Some(obj) if obj.get("postgres").and_then(|e| e.get("command"))
+            .and_then(|c| c.as_str())
+            .map_or(true, |cmd| cmd == binary) => "postgres".into(),
+        Some(_) => "pg-mcp".into(),
+        None => "postgres".into(),
+    }
 }
 
 #[tauri::command]
@@ -133,31 +167,24 @@ async fn add_to_claude_desktop() -> Result<String, String> {
             .map_err(|e| format!("Failed to read config: {}", e))?;
         serde_json::from_str(&contents).unwrap_or(serde_json::json!({}))
     } else {
-        // Create directory if needed
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create config dir: {}", e))?;
-        }
         serde_json::json!({})
     };
 
-    // Ensure mcpServers object exists
     if config.get("mcpServers").is_none() {
         config["mcpServers"] = serde_json::json!({});
     }
 
-    // Add/update the postgres entry
-    config["mcpServers"]["postgres"] = serde_json::json!({
+    let key = pg_mcp_key(config.get("mcpServers"), &binary);
+    config["mcpServers"][&key] = serde_json::json!({
         "command": binary,
         "args": ["serve"]
     });
 
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize: {}", e))?;
-    std::fs::write(&config_path, json)
-        .map_err(|e| format!("Failed to write config: {}", e))?;
-
-    Ok("Added to Claude Desktop. Restart Claude Desktop to connect.".into())
+    atomic_write_json(&config_path, &config)?;
+    Ok(format!(
+        "Added to Claude Desktop as '{}'. Restart Claude Desktop to connect.",
+        key
+    ))
 }
 
 #[tauri::command]
@@ -193,19 +220,19 @@ async fn add_to_claude_code() -> Result<String, String> {
         config["projects"][&home]["mcpServers"] = serde_json::json!({});
     }
 
-    config["projects"][&home]["mcpServers"]["postgres"] = serde_json::json!({
+    let key = pg_mcp_key(config["projects"][&home].get("mcpServers"), &binary);
+    config["projects"][&home]["mcpServers"][&key] = serde_json::json!({
         "type": "stdio",
         "command": binary,
         "args": ["serve"],
         "env": {}
     });
 
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize: {}", e))?;
-    std::fs::write(&config_path, json)
-        .map_err(|e| format!("Failed to write config: {}", e))?;
-
-    Ok("Added to Claude Code. Restart Claude Code to connect.".into())
+    atomic_write_json(&config_path, &config)?;
+    Ok(format!(
+        "Added to Claude Code as '{}'. Restart Claude Code to connect.",
+        key
+    ))
 }
 
 #[tauri::command]

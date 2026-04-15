@@ -1,13 +1,21 @@
 use crate::config::Connection;
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config as PgConfig, NoTls, Row};
 
 const MAX_RESULT_ROWS: usize = 100;
 const MAX_COLUMN_WIDTH: usize = 60;
+const STATEMENT_TIMEOUT: &str = "30s";
+const IDLE_IN_TXN_TIMEOUT: &str = "60s";
 
+/// Best-effort keyword blocklist. This is a UX fast-fail only — real
+/// readonly enforcement happens server-side via
+/// `SET default_transaction_read_only = on` applied at connect time.
 const WRITE_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE",
     "GRANT", "REVOKE", "COPY", "VACUUM", "REINDEX", "COMMENT", "SECURITY",
@@ -48,39 +56,7 @@ impl DatabaseManager {
 
     pub async fn connect(&self, conn: &Connection) -> Result<(), String> {
         self.disconnect().await;
-
-        let client = if let Some(ref conn_str) = conn.connection_string {
-            let (client, connection) = tokio_postgres::connect(conn_str, NoTls)
-                .await
-                .map_err(|e| format!("Connection failed: {}", e))?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    log::error!("Connection error: {}", e);
-                }
-            });
-            client
-        } else {
-            let mut config = PgConfig::new();
-            config
-                .host(&conn.host)
-                .port(conn.port)
-                .dbname(&conn.database)
-                .user(&conn.user)
-                .password(&conn.password)
-                .connect_timeout(std::time::Duration::from_secs(10));
-
-            let (client, connection) = config
-                .connect(NoTls)
-                .await
-                .map_err(|e| format!("Connection failed: {}", e))?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    log::error!("Connection error: {}", e);
-                }
-            });
-            client
-        };
-
+        let client = connect_client(conn).await?;
         *self.client.lock().await = Some(client);
         *self.active_connection_name.lock().await = Some(conn.name.clone());
         *self.in_transaction.lock().await = false;
@@ -108,7 +84,6 @@ impl DatabaseManager {
                 return true;
             }
         }
-        // Transaction control statements are not "writes" per se
         if normalized.starts_with("BEGIN") || normalized.starts_with("COMMIT")
             || normalized.starts_with("ROLLBACK") || normalized.starts_with("SAVEPOINT")
             || normalized.starts_with("RELEASE") {
@@ -128,6 +103,8 @@ impl DatabaseManager {
         sql: &str,
         readonly: bool,
     ) -> Result<String, String> {
+        // Fast-fail UX check. Real enforcement is via session-level
+        // default_transaction_read_only applied at connect time.
         if readonly && Self::check_write_query(sql) {
             return Err(
                 "Write operation blocked. This connection is read-only.\n\
@@ -135,27 +112,19 @@ impl DatabaseManager {
                     .into(),
             );
         }
+        self.execute_parameterized(sql, &[]).await
+    }
 
+    async fn execute_parameterized(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<String, String> {
         let start = Instant::now();
         let guard = self.get_client().await?;
         let client = guard.as_ref().unwrap();
 
-        let in_txn = *self.in_transaction.lock().await;
-
-        // Only wrap in read-only transaction if not already in a user-managed transaction
-        if readonly && !in_txn {
-            client
-                .execute("BEGIN TRANSACTION READ ONLY", &[])
-                .await
-                .map_err(|e| format!("Failed to begin transaction: {}", e))?;
-        }
-
-        let result = client.query(sql, &[]).await;
-
-        if readonly && !in_txn {
-            let _ = client.execute("COMMIT", &[]).await;
-        }
-
+        let result = client.query(sql, params).await;
         let duration_ms = start.elapsed().as_millis();
 
         match result {
@@ -165,9 +134,6 @@ impl DatabaseManager {
                 Ok(format_rows(&rows))
             }
             Err(e) => {
-                if readonly && !in_txn {
-                    let _ = client.execute("ROLLBACK", &[]).await;
-                }
                 let err = format!("Query error: {}", e);
                 self.record_query(sql, duration_ms, None, Some(err.clone())).await;
                 Err(err)
@@ -183,7 +149,9 @@ impl DatabaseManager {
         limit: usize,
         offset: usize,
     ) -> Result<String, String> {
-        // Wrap the query with LIMIT/OFFSET
+        // Clamp to sensible bounds; values are integers so safe to inline.
+        let limit = limit.min(10_000);
+        let offset = offset.min(10_000_000);
         let paginated = format!(
             "SELECT * FROM ({}) AS __pgmcp_paged LIMIT {} OFFSET {}",
             sql.trim().trim_end_matches(';'),
@@ -246,7 +214,7 @@ impl DatabaseManager {
         Ok("Transaction rolled back.".into())
     }
 
-    // ─── CRUD helpers ──────────────────────────────────────────────
+    // ─── CRUD helpers (parameterized) ──────────────────────────────
 
     pub async fn insert_rows(
         &self,
@@ -257,28 +225,47 @@ impl DatabaseManager {
         if rows.is_empty() {
             return Err("No rows provided.".into());
         }
-
-        let cols = columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
-        let mut value_groups = Vec::new();
-        for row in rows {
-            let vals = row.iter().map(|v| {
-                if v.eq_ignore_ascii_case("NULL") || v.eq_ignore_ascii_case("DEFAULT")
-                    || v.starts_with("NOW(") || v.starts_with("now(")
-                    || v.eq_ignore_ascii_case("TRUE") || v.eq_ignore_ascii_case("FALSE") {
-                    v.to_string()
-                } else {
-                    // Escape single quotes for safety
-                    format!("'{}'", v.replace('\'', "''"))
-                }
-            }).collect::<Vec<_>>().join(", ");
-            value_groups.push(format!("({})", vals));
+        if columns.is_empty() {
+            return Err("No columns provided.".into());
         }
 
+        let (schema_q, tbl_q) = parse_qualified(table);
+        let col_list = columns
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut value_groups: Vec<String> = Vec::new();
+        for row in rows {
+            if row.len() != columns.len() {
+                return Err(format!(
+                    "Row has {} values but {} columns were declared",
+                    row.len(),
+                    columns.len()
+                ));
+            }
+            let rendered: Vec<String> = row
+                .iter()
+                .map(|v| match literal_sentinel(v) {
+                    Some(lit) => lit.to_string(),
+                    None => dollar_quote(v),
+                })
+                .collect();
+            value_groups.push(format!("({})", rendered.join(", ")));
+        }
+
+        // Values are dollar-quoted literals so PG's usual unknown→column
+        // type coercion applies (same behavior as before the rewrite), but
+        // injection via embedded quotes/backslashes is impossible.
         let sql = format!(
-            "INSERT INTO {} ({}) VALUES {} RETURNING *",
-            table, cols, value_groups.join(", ")
+            "INSERT INTO {}.{} ({}) VALUES {} RETURNING *",
+            schema_q,
+            tbl_q,
+            col_list,
+            value_groups.join(", ")
         );
-        self.execute_query(&sql, false).await
+        self.execute_parameterized(&sql, &[]).await
     }
 
     pub async fn update_rows(
@@ -294,21 +281,32 @@ impl DatabaseManager {
             return Err("WHERE condition is required for safety. Use 'TRUE' to update all rows.".into());
         }
 
-        let set_clause = set_columns.iter().map(|(col, val)| {
-            if val.eq_ignore_ascii_case("NULL") || val.eq_ignore_ascii_case("DEFAULT")
-                || val.starts_with("NOW(") || val.starts_with("now(")
-                || val.eq_ignore_ascii_case("TRUE") || val.eq_ignore_ascii_case("FALSE") {
-                format!("\"{}\" = {}", col, val)
-            } else {
-                format!("\"{}\" = '{}'", col, val.replace('\'', "''"))
-            }
-        }).collect::<Vec<_>>().join(", ");
+        let (schema_q, tbl_q) = parse_qualified(table);
 
+        let mut keys: Vec<&String> = set_columns.keys().collect();
+        keys.sort();
+        let set_parts: Vec<String> = keys
+            .into_iter()
+            .map(|col| {
+                let val = &set_columns[col];
+                let col_q = quote_ident(col);
+                match literal_sentinel(val) {
+                    Some(lit) => format!("{} = {}", col_q, lit),
+                    None => format!("{} = {}", col_q, dollar_quote(val)),
+                }
+            })
+            .collect();
+
+        // NOTE: `conditions` is raw SQL by API contract; callers are
+        // responsible for trusting the source of the WHERE clause.
         let sql = format!(
-            "UPDATE {} SET {} WHERE {} RETURNING *",
-            table, set_clause, conditions
+            "UPDATE {}.{} SET {} WHERE {} RETURNING *",
+            schema_q,
+            tbl_q,
+            set_parts.join(", "),
+            conditions
         );
-        self.execute_query(&sql, false).await
+        self.execute_parameterized(&sql, &[]).await
     }
 
     pub async fn delete_rows(
@@ -320,11 +318,12 @@ impl DatabaseManager {
             return Err("WHERE condition is required for safety. Use 'TRUE' to delete all rows.".into());
         }
 
+        let (schema_q, tbl_q) = parse_qualified(table);
         let sql = format!(
-            "DELETE FROM {} WHERE {} RETURNING *",
-            table, conditions
+            "DELETE FROM {}.{} WHERE {} RETURNING *",
+            schema_q, tbl_q, conditions
         );
-        self.execute_query(&sql, false).await
+        self.execute_parameterized(&sql, &[]).await
     }
 
     // ─── Explain / dry-run ─────────────────────────────────────────
@@ -333,61 +332,67 @@ impl DatabaseManager {
         &self,
         sql: &str,
         analyze: bool,
+        readonly: bool,
     ) -> Result<String, String> {
+        // If the connection is read-only, refuse EXPLAIN ANALYZE of a
+        // suspected write. Plain EXPLAIN is harmless. Server-side
+        // default_transaction_read_only will also block writes here, but
+        // the early refusal is clearer.
+        if analyze && readonly && Self::check_write_query(sql) {
+            return Err(
+                "EXPLAIN ANALYZE would execute this write statement. \
+                 Blocked by read-only mode."
+                    .into(),
+            );
+        }
         let prefix = if analyze { "EXPLAIN ANALYZE" } else { "EXPLAIN" };
         let explain_sql = format!("{} {}", prefix, sql);
-        // EXPLAIN is always safe to run (read-only), unless ANALYZE on a write
-        self.execute_query(&explain_sql, false).await
+        self.execute_parameterized(&explain_sql, &[]).await
     }
 
     // ─── Enhanced describe_table ───────────────────────────────────
 
     pub async fn describe_table(&self, table: &str) -> Result<String, String> {
-        let (schema, tbl) = if table.contains('.') {
-            let parts: Vec<&str> = table.splitn(2, '.').collect();
-            (parts[0], parts[1])
-        } else {
-            ("public", table)
-        };
+        let (schema, tbl) = split_qualified(table);
 
         let guard = self.get_client().await?;
         let client = guard.as_ref().unwrap();
 
-        // --- Row count (#5) ---
-        let count_sql = format!(
+        // --- Row count ---
+        let count_sql =
             "SELECT n_live_tup::bigint AS approx_rows \
              FROM pg_stat_user_tables \
-             WHERE schemaname = '{}' AND relname = '{}'",
-            schema, tbl
-        );
-        let count_rows = client.query(&count_sql, &[]).await.unwrap_or_default();
-        let approx_rows: i64 = count_rows.first()
+             WHERE schemaname = $1 AND relname = $2";
+        let count_rows = client.query(count_sql, &[&schema, &tbl]).await.unwrap_or_default();
+        let approx_rows: i64 = count_rows
+            .first()
             .and_then(|r| r.try_get(0).ok())
             .unwrap_or(0);
 
         let mut output = format!("{}.{} (~{} rows)\n\n", schema, tbl, approx_rows);
 
         // --- Columns ---
-        let col_sql = format!(
+        let col_sql =
             "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
-             pgd.description AS column_comment \
+                    pgd.description AS column_comment \
              FROM information_schema.columns c \
              LEFT JOIN pg_catalog.pg_statio_all_tables st \
                 ON st.schemaname = c.table_schema AND st.relname = c.table_name \
              LEFT JOIN pg_catalog.pg_description pgd \
                 ON pgd.objoid = st.relid AND pgd.objsubid = c.ordinal_position \
-             WHERE c.table_schema = '{}' AND c.table_name = '{}' \
-             ORDER BY c.ordinal_position",
-            schema, tbl
-        );
-        let col_rows = client.query(&col_sql, &[]).await
+             WHERE c.table_schema = $1 AND c.table_name = $2 \
+             ORDER BY c.ordinal_position";
+        let col_rows = client
+            .query(col_sql, &[&schema, &tbl])
+            .await
             .map_err(|e| format!("Query error: {}", e))?;
 
         output.push_str("Columns:\n");
         output.push_str(&format_rows(&col_rows));
 
-        // --- JSONB column inspection (#6) ---
-        let jsonb_cols: Vec<String> = col_rows.iter()
+        // --- JSONB column inspection ---
+        let jsonb_cols: Vec<String> = col_rows
+            .iter()
             .filter(|r| {
                 let dt: String = r.try_get::<_, String>(1).unwrap_or_default();
                 dt == "jsonb" || dt == "json"
@@ -397,34 +402,42 @@ impl DatabaseManager {
 
         if !jsonb_cols.is_empty() {
             output.push_str("\nJSONB Column Keys (sampled from first 100 rows):\n");
+            let schema_q = quote_ident(&schema);
+            let tbl_q = quote_ident(&tbl);
             for col_name in &jsonb_cols {
+                let col_q = quote_ident(col_name);
+                // Identifiers are safely quoted; no user-controlled strings
+                // are interpolated as SQL fragments here.
                 let sample_sql = format!(
-                    "SELECT DISTINCT jsonb_object_keys(\"{}\") AS key \
-                     FROM (SELECT \"{}\" FROM {}.{} WHERE \"{}\" IS NOT NULL LIMIT 100) sub \
+                    "SELECT DISTINCT jsonb_object_keys({col}) AS key \
+                     FROM (SELECT {col} FROM {schema}.{tbl} WHERE {col} IS NOT NULL LIMIT 100) sub \
                      ORDER BY key",
-                    col_name, col_name, schema, tbl, col_name
+                    col = col_q,
+                    schema = schema_q,
+                    tbl = tbl_q,
                 );
                 match client.query(&sample_sql, &[]).await {
                     Ok(key_rows) => {
-                        let keys: Vec<String> = key_rows.iter()
+                        let keys: Vec<String> = key_rows
+                            .iter()
                             .filter_map(|r| r.try_get::<_, String>(0).ok())
                             .collect();
                         if !keys.is_empty() {
                             output.push_str(&format!("  {}: {}\n", col_name, keys.join(", ")));
                         }
                     }
-                    Err(_) => {} // Skip if column isn't actually jsonb
+                    Err(_) => {}
                 }
             }
         }
 
         // --- Indexes ---
-        let idx_sql = format!(
+        let idx_sql =
             "SELECT indexname, indexdef FROM pg_indexes \
-             WHERE schemaname = '{}' AND tablename = '{}'",
-            schema, tbl
-        );
-        let idx_rows = client.query(&idx_sql, &[]).await
+             WHERE schemaname = $1 AND tablename = $2";
+        let idx_rows = client
+            .query(idx_sql, &[&schema, &tbl])
+            .await
             .map_err(|e| format!("Query error: {}", e))?;
         if !idx_rows.is_empty() {
             output.push_str("\nIndexes:\n");
@@ -432,41 +445,45 @@ impl DatabaseManager {
         }
 
         // --- Outgoing foreign keys ---
-        let fk_sql = format!(
+        let fk_sql =
             "SELECT tc.constraint_name, kcu.column_name, \
-             ccu.table_schema || '.' || ccu.table_name AS foreign_table, \
-             ccu.column_name AS foreign_column \
+                    ccu.table_schema || '.' || ccu.table_name AS foreign_table, \
+                    ccu.column_name AS foreign_column \
              FROM information_schema.table_constraints tc \
              JOIN information_schema.key_column_usage kcu \
-                ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
+                ON tc.constraint_name = kcu.constraint_name \
+                AND tc.table_schema = kcu.table_schema \
              JOIN information_schema.constraint_column_usage ccu \
-                ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema \
+                ON ccu.constraint_name = tc.constraint_name \
+                AND ccu.table_schema = tc.table_schema \
              WHERE tc.constraint_type = 'FOREIGN KEY' \
-                AND tc.table_schema = '{}' AND tc.table_name = '{}'",
-            schema, tbl
-        );
-        let fk_rows = client.query(&fk_sql, &[]).await
+                AND tc.table_schema = $1 AND tc.table_name = $2";
+        let fk_rows = client
+            .query(fk_sql, &[&schema, &tbl])
+            .await
             .map_err(|e| format!("Query error: {}", e))?;
         if !fk_rows.is_empty() {
             output.push_str("\nOutgoing Foreign Keys:\n");
             output.push_str(&format_rows(&fk_rows));
         }
 
-        // --- Incoming foreign keys (#7) ---
-        let rfk_sql = format!(
+        // --- Incoming foreign keys ---
+        let rfk_sql =
             "SELECT tc.table_schema || '.' || tc.table_name AS referencing_table, \
-             kcu.column_name AS referencing_column, \
-             tc.constraint_name \
+                    kcu.column_name AS referencing_column, \
+                    tc.constraint_name \
              FROM information_schema.table_constraints tc \
              JOIN information_schema.key_column_usage kcu \
-                ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
+                ON tc.constraint_name = kcu.constraint_name \
+                AND tc.table_schema = kcu.table_schema \
              JOIN information_schema.constraint_column_usage ccu \
-                ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema \
+                ON ccu.constraint_name = tc.constraint_name \
+                AND ccu.table_schema = tc.table_schema \
              WHERE tc.constraint_type = 'FOREIGN KEY' \
-                AND ccu.table_schema = '{}' AND ccu.table_name = '{}'",
-            schema, tbl
-        );
-        let rfk_rows = client.query(&rfk_sql, &[]).await
+                AND ccu.table_schema = $1 AND ccu.table_name = $2";
+        let rfk_rows = client
+            .query(rfk_sql, &[&schema, &tbl])
+            .await
             .map_err(|e| format!("Query error: {}", e))?;
         if !rfk_rows.is_empty() {
             output.push_str("\nIncoming Foreign Keys (tables referencing this one):\n");
@@ -476,23 +493,26 @@ impl DatabaseManager {
         Ok(output)
     }
 
-    // ─── Enhanced list_tables (#8) ─────────────────────────────────
+    // ─── Enhanced list_tables ──────────────────────────────────────
 
-    pub async fn list_tables(&self, schema: Option<&str>, include_counts: bool) -> Result<String, String> {
+    pub async fn list_tables(
+        &self,
+        schema: Option<&str>,
+        include_counts: bool,
+    ) -> Result<String, String> {
         let guard = self.get_client().await?;
         let client = guard.as_ref().unwrap();
 
-        let schema_filter = if let Some(s) = schema {
-            format!("= '{}'", s)
-        } else {
-            "NOT IN ('pg_catalog', 'information_schema')".to_string()
+        let (schema_pred, params_owned): (&str, Vec<String>) = match schema {
+            Some(s) => ("= $1", vec![s.to_string()]),
+            None => ("NOT IN ('pg_catalog', 'information_schema')", Vec::new()),
         };
 
         let sql = if include_counts {
             format!(
                 "SELECT t.schemaname, t.tablename AS name, 'table' AS type, \
-                 COALESCE(s.n_live_tup, 0)::bigint AS approx_rows, \
-                 obj_description(c.oid) AS description \
+                        COALESCE(s.n_live_tup, 0)::bigint AS approx_rows, \
+                        obj_description(c.oid) AS description \
                  FROM pg_tables t \
                  LEFT JOIN pg_stat_user_tables s \
                     ON s.schemaname = t.schemaname AND s.relname = t.tablename \
@@ -500,68 +520,53 @@ impl DatabaseManager {
                     ON c.relname = t.tablename \
                  LEFT JOIN pg_namespace n \
                     ON n.oid = c.relnamespace AND n.nspname = t.schemaname \
-                 WHERE t.schemaname {} \
+                 WHERE t.schemaname {pred} \
                  UNION ALL \
                  SELECT v.schemaname, v.viewname AS name, 'view' AS type, \
-                 0::bigint AS approx_rows, \
-                 obj_description(c.oid) AS description \
+                        0::bigint AS approx_rows, \
+                        obj_description(c.oid) AS description \
                  FROM pg_views v \
                  LEFT JOIN pg_class c \
                     ON c.relname = v.viewname \
                  LEFT JOIN pg_namespace n \
                     ON n.oid = c.relnamespace AND n.nspname = v.schemaname \
-                 WHERE v.schemaname {} \
+                 WHERE v.schemaname {pred} \
                  ORDER BY schemaname, name",
-                schema_filter, schema_filter
+                pred = schema_pred
             )
         } else {
             format!(
                 "SELECT schemaname, tablename AS name, 'table' AS type FROM pg_tables \
-                 WHERE schemaname {} \
+                 WHERE schemaname {pred} \
                  UNION ALL \
                  SELECT schemaname, viewname AS name, 'view' AS type FROM pg_views \
-                 WHERE schemaname {} \
+                 WHERE schemaname {pred} \
                  ORDER BY schemaname, name",
-                schema_filter, schema_filter
+                pred = schema_pred
             )
         };
 
-        let rows = client.query(&sql, &[]).await
+        // Both occurrences of `schemaname {pred}` share the same param list
+        // when `= $1` is used. Postgres expects one $1 binding regardless
+        // of how many times it appears.
+        let params: Vec<&(dyn ToSql + Sync)> =
+            params_owned.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let rows = client
+            .query(&sql, &params)
+            .await
             .map_err(|e| format!("Query error: {}", e))?;
         Ok(format_rows(&rows))
     }
 
-    // ─── Other tools (unchanged) ───────────────────────────────────
+    // ─── Other tools ───────────────────────────────────────────────
 
     pub async fn test_connection(conn: &Connection) -> Result<(String, u128), String> {
         let start = Instant::now();
-
-        let client = if let Some(ref conn_str) = conn.connection_string {
-            let (client, connection) = tokio_postgres::connect(conn_str, NoTls)
-                .await
-                .map_err(|e| format!("Connection failed: {}", e))?;
-            tokio::spawn(async move { let _ = connection.await; });
-            client
-        } else {
-            let mut config = PgConfig::new();
-            config
-                .host(&conn.host)
-                .port(conn.port)
-                .dbname(&conn.database)
-                .user(&conn.user)
-                .password(&conn.password)
-                .connect_timeout(std::time::Duration::from_secs(10));
-            let (client, connection) = config
-                .connect(NoTls)
-                .await
-                .map_err(|e| format!("Connection failed: {}", e))?;
-            tokio::spawn(async move { let _ = connection.await; });
-            client
-        };
-
-        let row = client.query_one("SELECT version()", &[]).await
+        let client = connect_client(conn).await?;
+        let row = client
+            .query_one("SELECT version()", &[])
+            .await
             .map_err(|e| format!("Query failed: {}", e))?;
-
         let version: String = row.get(0);
         let latency = start.elapsed().as_millis();
         Ok((version, latency))
@@ -574,12 +579,14 @@ impl DatabaseManager {
                    FROM pg_namespace n \
                    LEFT JOIN pg_class c ON c.relnamespace = n.oid \
                    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
-                   AND n.nspname NOT LIKE 'pg_temp%' \
+                     AND n.nspname NOT LIKE 'pg_temp%' \
                    GROUP BY n.nspname \
                    ORDER BY n.nspname";
         let guard = self.get_client().await?;
         let client = guard.as_ref().unwrap();
-        let rows = client.query(sql, &[]).await
+        let rows = client
+            .query(sql, &[])
+            .await
             .map_err(|e| format!("Query error: {}", e))?;
         Ok(format_rows(&rows))
     }
@@ -590,45 +597,46 @@ impl DatabaseManager {
         limit: Option<usize>,
     ) -> Result<String, String> {
         let limit = limit.unwrap_or(5).min(50);
-        let sql = format!("SELECT * FROM {} LIMIT {}", table, limit);
+        let (schema_q, tbl_q) = parse_qualified(table);
+        let sql = format!("SELECT * FROM {}.{} LIMIT {}", schema_q, tbl_q, limit);
         self.execute_query(&sql, true).await
     }
 
     pub async fn get_schema_diagram(&self, schema: Option<&str>) -> Result<String, String> {
-        let schema = schema.unwrap_or("public");
+        let schema = schema.unwrap_or("public").to_string();
         let guard = self.get_client().await?;
         let client = guard.as_ref().unwrap();
 
-        let col_sql = format!(
+        let col_sql =
             "SELECT c.table_name, c.column_name, c.data_type, \
-             CASE WHEN pk.column_name IS NOT NULL THEN 'PK' ELSE '' END AS is_pk \
+                    CASE WHEN pk.column_name IS NOT NULL THEN 'PK' ELSE '' END AS is_pk \
              FROM information_schema.columns c \
              LEFT JOIN ( \
                 SELECT kcu.table_name, kcu.column_name \
                 FROM information_schema.table_constraints tc \
                 JOIN information_schema.key_column_usage kcu \
                     ON tc.constraint_name = kcu.constraint_name \
-                WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = '{}' \
+                WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 \
              ) pk ON c.table_name = pk.table_name AND c.column_name = pk.column_name \
-             WHERE c.table_schema = '{}' \
-             ORDER BY c.table_name, c.ordinal_position",
-            schema, schema
-        );
-        let col_rows = client.query(&col_sql, &[]).await
+             WHERE c.table_schema = $1 \
+             ORDER BY c.table_name, c.ordinal_position";
+        let col_rows = client
+            .query(col_sql, &[&schema])
+            .await
             .map_err(|e| format!("Query error: {}", e))?;
 
-        let fk_sql = format!(
+        let fk_sql =
             "SELECT tc.table_name, kcu.column_name, \
-             ccu.table_name AS foreign_table, ccu.column_name AS foreign_column \
+                    ccu.table_name AS foreign_table, ccu.column_name AS foreign_column \
              FROM information_schema.table_constraints tc \
              JOIN information_schema.key_column_usage kcu \
                 ON tc.constraint_name = kcu.constraint_name \
              JOIN information_schema.constraint_column_usage ccu \
                 ON ccu.constraint_name = tc.constraint_name \
-             WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = '{}'",
-            schema
-        );
-        let fk_rows = client.query(&fk_sql, &[]).await
+             WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1";
+        let fk_rows = client
+            .query(fk_sql, &[&schema])
+            .await
             .map_err(|e| format!("Query error: {}", e))?;
 
         let mut tables: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
@@ -637,7 +645,10 @@ impl DatabaseManager {
             let col_name: String = row.get(1);
             let data_type: String = row.get(2);
             let is_pk: String = row.get(3);
-            tables.entry(table_name).or_default().push((col_name, data_type, is_pk));
+            tables
+                .entry(table_name)
+                .or_default()
+                .push((col_name, data_type, is_pk));
         }
 
         let mut diagram = format!("Schema: {}\n\n", schema);
@@ -669,9 +680,15 @@ impl DatabaseManager {
         Ok(diagram)
     }
 
-    // ─── Query history (#10) ───────────────────────────────────────
+    // ─── Query history ─────────────────────────────────────────────
 
-    async fn record_query(&self, sql: &str, duration_ms: u128, row_count: Option<usize>, error: Option<String>) {
+    async fn record_query(
+        &self,
+        sql: &str,
+        duration_ms: u128,
+        row_count: Option<usize>,
+        error: Option<String>,
+    ) {
         let record = QueryRecord {
             sql: sql.to_string(),
             timestamp: chrono::Utc::now().naive_utc(),
@@ -681,7 +698,6 @@ impl DatabaseManager {
         };
         let mut history = self.query_history.lock().await;
         history.push(record);
-        // Keep last 200 queries
         if history.len() > 200 {
             let excess = history.len() - 200;
             history.drain(0..excess);
@@ -713,6 +729,158 @@ impl DatabaseManager {
         }
 
         output
+    }
+}
+
+// ─── Connection helpers ─────────────────────────────────────────────
+
+async fn connect_client(conn: &Connection) -> Result<Client, String> {
+    let client = if conn.ssl {
+        let tls = TlsConnector::builder()
+            .build()
+            .map_err(|e| format!("TLS setup failed: {}", e))?;
+        let tls = MakeTlsConnector::new(tls);
+
+        if let Some(ref cs) = conn.connection_string {
+            let (c, h) = tokio_postgres::connect(cs, tls)
+                .await
+                .map_err(|e| format!("Connection failed (TLS): {}", e))?;
+            tokio::spawn(async move {
+                if let Err(e) = h.await {
+                    log::error!("Connection error: {}", e);
+                }
+            });
+            c
+        } else {
+            let cfg = build_pg_config(conn);
+            let (c, h) = cfg
+                .connect(tls)
+                .await
+                .map_err(|e| format!("Connection failed (TLS): {}", e))?;
+            tokio::spawn(async move {
+                if let Err(e) = h.await {
+                    log::error!("Connection error: {}", e);
+                }
+            });
+            c
+        }
+    } else {
+        if let Some(ref cs) = conn.connection_string {
+            let (c, h) = tokio_postgres::connect(cs, NoTls)
+                .await
+                .map_err(|e| format!("Connection failed: {}", e))?;
+            tokio::spawn(async move {
+                if let Err(e) = h.await {
+                    log::error!("Connection error: {}", e);
+                }
+            });
+            c
+        } else {
+            let cfg = build_pg_config(conn);
+            let (c, h) = cfg
+                .connect(NoTls)
+                .await
+                .map_err(|e| format!("Connection failed: {}", e))?;
+            tokio::spawn(async move {
+                if let Err(e) = h.await {
+                    log::error!("Connection error: {}", e);
+                }
+            });
+            c
+        }
+    };
+
+    harden_session(&client, conn.readonly).await?;
+    Ok(client)
+}
+
+fn build_pg_config(conn: &Connection) -> PgConfig {
+    let mut cfg = PgConfig::new();
+    cfg.host(&conn.host)
+        .port(conn.port)
+        .dbname(&conn.database)
+        .user(&conn.user)
+        .password(&conn.password)
+        .connect_timeout(std::time::Duration::from_secs(10));
+    cfg
+}
+
+/// Apply per-session guardrails after connect:
+/// - statement_timeout: bounds any single query
+/// - idle_in_transaction_session_timeout: prevents dangling txns locking rows
+/// - default_transaction_read_only: server-side readonly enforcement
+///   (catches CTE writes, side-effecting functions, etc. that the client-side
+///   keyword blocklist cannot)
+async fn harden_session(client: &Client, readonly: bool) -> Result<(), String> {
+    let base = format!(
+        "SET statement_timeout = '{}'; SET idle_in_transaction_session_timeout = '{}';",
+        STATEMENT_TIMEOUT, IDLE_IN_TXN_TIMEOUT
+    );
+    client
+        .batch_execute(&base)
+        .await
+        .map_err(|e| format!("Failed to apply session timeouts: {}", e))?;
+
+    if readonly {
+        client
+            .batch_execute("SET default_transaction_read_only = on;")
+            .await
+            .map_err(|e| format!("Failed to apply readonly mode: {}", e))?;
+    }
+    Ok(())
+}
+
+// ─── Identifier helpers ─────────────────────────────────────────────
+
+/// Quote a SQL identifier. Doubles any embedded double-quote.
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Split "schema.table" or "table" and return owned un-quoted parts for
+/// use as query *parameters* (not interpolated into SQL).
+fn split_qualified(table: &str) -> (String, String) {
+    if let Some((s, t)) = table.split_once('.') {
+        (s.to_string(), t.to_string())
+    } else {
+        ("public".to_string(), table.to_string())
+    }
+}
+
+/// Parse "schema.table" or "table" and return quoted identifiers safe to
+/// interpolate into SQL.
+fn parse_qualified(table: &str) -> (String, String) {
+    let (s, t) = split_qualified(table);
+    (quote_ident(&s), quote_ident(&t))
+}
+
+/// Wrap a value in a PostgreSQL dollar-quoted string literal. The tag is
+/// expanded until it does not appear in the value, making injection via
+/// crafted input impossible — the closing delimiter is always unique.
+/// Unlike single-quote escaping, this is unaffected by
+/// `standard_conforming_strings`.
+fn dollar_quote(v: &str) -> String {
+    let mut tag = String::from("pgmcp");
+    while v.contains(&format!("${}$", tag)) {
+        tag.push('_');
+    }
+    format!("${tag}${v}${tag}$", tag = tag, v = v)
+}
+
+/// Recognize a narrow set of literal SQL sentinels that callers may want
+/// to emit unquoted in INSERT/UPDATE value positions. Anything else is
+/// treated as a bind parameter.
+fn literal_sentinel(v: &str) -> Option<&'static str> {
+    match v.trim().to_uppercase().as_str() {
+        "NULL" => Some("NULL"),
+        "DEFAULT" => Some("DEFAULT"),
+        "TRUE" => Some("TRUE"),
+        "FALSE" => Some("FALSE"),
+        "NOW()" => Some("NOW()"),
+        "CURRENT_TIMESTAMP" => Some("CURRENT_TIMESTAMP"),
+        "CURRENT_DATE" => Some("CURRENT_DATE"),
+        "CURRENT_TIME" => Some("CURRENT_TIME"),
+        _ => None,
     }
 }
 
@@ -751,7 +919,9 @@ fn format_rows(rows: &[Row]) -> String {
     }
 
     let mut output = String::new();
-    let header_line: Vec<String> = headers.iter().enumerate()
+    let header_line: Vec<String> = headers
+        .iter()
+        .enumerate()
         .map(|(i, h)| format!("{:width$}", h, width = widths[i]))
         .collect();
     output.push_str(&header_line.join(" | "));
@@ -762,7 +932,9 @@ fn format_rows(rows: &[Row]) -> String {
     output.push('\n');
 
     for row_data in &data {
-        let line: Vec<String> = row_data.iter().enumerate()
+        let line: Vec<String> = row_data
+            .iter()
+            .enumerate()
             .map(|(i, v)| format!("{:width$}", v, width = widths.get(i).copied().unwrap_or(0)))
             .collect();
         output.push_str(&line.join(" | "));
@@ -779,8 +951,6 @@ fn format_rows(rows: &[Row]) -> String {
     output
 }
 
-/// BUG FIX #1: Handle all PostgreSQL types properly so RETURNING clauses
-/// with timestamps, UUIDs, numerics, etc. don't show as NULL.
 fn get_cell_string(row: &Row, idx: usize, ty: &tokio_postgres::types::Type) -> String {
     use tokio_postgres::types::Type;
 
@@ -792,55 +962,41 @@ fn get_cell_string(row: &Row, idx: usize, ty: &tokio_postgres::types::Type) -> S
         Type::FLOAT4 => try_get_opt::<f32>(row, idx),
         Type::FLOAT8 => try_get_opt::<f64>(row, idx),
         Type::NUMERIC => try_get_opt::<rust_decimal::Decimal>(row, idx),
-        Type::JSON | Type::JSONB => {
-            match row.try_get::<_, Option<serde_json::Value>>(idx) {
-                Ok(Some(v)) => v.to_string(),
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
-        Type::TIMESTAMP => {
-            match row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
-                Ok(Some(v)) => v.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
-        Type::TIMESTAMPTZ => {
-            match row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
-                Ok(Some(v)) => v.format("%Y-%m-%d %H:%M:%S%.f%z").to_string(),
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
-        Type::DATE => {
-            match row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
-                Ok(Some(v)) => v.format("%Y-%m-%d").to_string(),
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
-        Type::TIME => {
-            match row.try_get::<_, Option<chrono::NaiveTime>>(idx) {
-                Ok(Some(v)) => v.format("%H:%M:%S%.f").to_string(),
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
-        Type::UUID => {
-            match row.try_get::<_, Option<uuid::Uuid>>(idx) {
-                Ok(Some(v)) => v.to_string(),
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
-        Type::BYTEA => {
-            match row.try_get::<_, Option<Vec<u8>>>(idx) {
-                Ok(Some(v)) => format!("\\x{}", hex::encode(&v)),
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
+        Type::JSON | Type::JSONB => match row.try_get::<_, Option<serde_json::Value>>(idx) {
+            Ok(Some(v)) => v.to_string(),
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
+        Type::TIMESTAMP => match row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
+            Ok(Some(v)) => v.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
+        Type::TIMESTAMPTZ => match row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
+            Ok(Some(v)) => v.format("%Y-%m-%d %H:%M:%S%.f%z").to_string(),
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
+        Type::DATE => match row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
+            Ok(Some(v)) => v.format("%Y-%m-%d").to_string(),
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
+        Type::TIME => match row.try_get::<_, Option<chrono::NaiveTime>>(idx) {
+            Ok(Some(v)) => v.format("%H:%M:%S%.f").to_string(),
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
+        Type::UUID => match row.try_get::<_, Option<uuid::Uuid>>(idx) {
+            Ok(Some(v)) => v.to_string(),
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
+        Type::BYTEA => match row.try_get::<_, Option<Vec<u8>>>(idx) {
+            Ok(Some(v)) => format!("\\x{}", hex::encode(&v)),
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
         Type::CHAR_ARRAY | Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => {
             match row.try_get::<_, Option<Vec<String>>>(idx) {
                 Ok(Some(v)) => format!("{{{}}}", v.join(",")),
@@ -848,21 +1004,19 @@ fn get_cell_string(row: &Row, idx: usize, ty: &tokio_postgres::types::Type) -> S
                 Err(_) => "NULL".into(),
             }
         }
-        Type::INT4_ARRAY => {
-            match row.try_get::<_, Option<Vec<i32>>>(idx) {
-                Ok(Some(v)) => format!("{{{}}}", v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")),
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
-        _ => {
-            // Generic fallback: try as String (works for text, varchar, char, citext, enums, etc.)
-            match row.try_get::<_, Option<String>>(idx) {
-                Ok(Some(v)) => v,
-                Ok(None) => "NULL".into(),
-                Err(_) => "NULL".into(),
-            }
-        }
+        Type::INT4_ARRAY => match row.try_get::<_, Option<Vec<i32>>>(idx) {
+            Ok(Some(v)) => format!(
+                "{{{}}}",
+                v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+            ),
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
+        _ => match row.try_get::<_, Option<String>>(idx) {
+            Ok(Some(v)) => v,
+            Ok(None) => "NULL".into(),
+            Err(_) => "NULL".into(),
+        },
     }
 }
 

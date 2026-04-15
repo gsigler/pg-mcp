@@ -514,7 +514,7 @@ impl McpServer {
         let sql = args.get("sql").and_then(|s| s.as_str()).ok_or("Missing: sql")?;
         let analyze = args.get("analyze").and_then(|b| b.as_bool()).unwrap_or(false);
         let banner = Self::connection_banner(&conn);
-        let result = self.db.explain_query(sql, analyze).await?;
+        let result = self.db.explain_query(sql, analyze, conn.readonly).await?;
         Ok(format!("{}\n{}", banner, result))
     }
 
