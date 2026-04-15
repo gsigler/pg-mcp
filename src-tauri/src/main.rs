@@ -228,32 +228,41 @@ async fn add_to_claude_code() -> Result<String, String> {
         serde_json::json!({})
     };
 
-    // Claude Code stores MCP servers under projects.<home_dir>.mcpServers
-    let home = dirs::home_dir()
-        .ok_or("Cannot find home directory")?
-        .display().to_string();
-
-    if config.get("projects").is_none() {
-        config["projects"] = serde_json::json!({});
+    // Register at USER scope (top-level `mcpServers`) so the server is
+    // available regardless of which directory the user runs `claude`
+    // from. A prior version of this command wrote to
+    // `projects.<home>.mcpServers`, which is project scope and only
+    // worked when claude was invoked from the home directory — silently
+    // broken everywhere else. Scrub that old entry if it's ours.
+    if config.get("mcpServers").is_none() {
+        config["mcpServers"] = serde_json::json!({});
     }
-    if config["projects"].get(&home).is_none() {
-        config["projects"][&home] = serde_json::json!({});
-    }
-    if config["projects"][&home].get("mcpServers").is_none() {
-        config["projects"][&home]["mcpServers"] = serde_json::json!({});
-    }
-
-    let key = pg_mcp_key(config["projects"][&home].get("mcpServers"), &binary);
-    config["projects"][&home]["mcpServers"][&key] = serde_json::json!({
+    let key = pg_mcp_key(config.get("mcpServers"), &binary);
+    config["mcpServers"][&key] = serde_json::json!({
         "type": "stdio",
         "command": binary,
         "args": ["serve"],
         "env": {}
     });
 
+    // Clean up any previous project-scoped install pointing at our binary
+    // so the user doesn't end up with duplicate registrations.
+    if let Some(home) = dirs::home_dir().map(|h| h.display().to_string()) {
+        if let Some(mcps) = config
+            .get_mut("projects")
+            .and_then(|p| p.get_mut(&home))
+            .and_then(|h| h.get_mut("mcpServers"))
+            .and_then(|m| m.as_object_mut())
+        {
+            mcps.retain(|_k, v| {
+                v.get("command").and_then(|c| c.as_str()) != Some(&binary)
+            });
+        }
+    }
+
     atomic_write_json(&config_path, &config)?;
     Ok(format!(
-        "Added to Claude Code as '{}'. Restart Claude Code to connect.",
+        "Added to Claude Code as '{}' (user scope). Restart Claude Code to connect.",
         key
     ))
 }
@@ -264,23 +273,54 @@ async fn check_agent_status() -> Result<serde_json::Value, String> {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 
-    // Check Claude Desktop
+    // True if any entry under `mcpServers` (at the given JSON path) has a
+    // `command` that matches our binary.
+    fn has_our_binary(map: Option<&serde_json::Value>, binary: &str) -> bool {
+        map.and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.values().any(|entry| {
+                    entry
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map_or(false, |cmd| cmd == binary)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     let desktop_path = dirs::home_dir()
         .map(|h| h.join("Library/Application Support/Claude/claude_desktop_config.json"));
-    let desktop_installed = desktop_path.as_ref()
+    let desktop_cfg: Option<serde_json::Value> = desktop_path
+        .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("mcpServers")?.get("postgres")?.get("command").cloned())
-        .map_or(false, |cmd| cmd.as_str() == Some(&binary));
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let desktop_installed =
+        has_our_binary(desktop_cfg.as_ref().and_then(|v| v.get("mcpServers")), &binary);
 
-    // Check Claude Code
+    // Claude Code: we install at user scope (top-level `mcpServers`),
+    // but earlier builds wrote to project scope under the home directory.
+    // Treat either location as "installed".
     let code_path = dirs::home_dir().map(|h| h.join(".claude.json"));
-    let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
-    let code_installed = code_path.as_ref()
+    let code_cfg: Option<serde_json::Value> = code_path
+        .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("projects")?.get(&home)?.get("mcpServers")?.get("postgres")?.get("command").cloned())
-        .map_or(false, |cmd| cmd.as_str() == Some(&binary));
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let home = dirs::home_dir()
+        .map(|h| h.display().to_string())
+        .unwrap_or_default();
+    let code_user_scope = has_our_binary(
+        code_cfg.as_ref().and_then(|v| v.get("mcpServers")),
+        &binary,
+    );
+    let code_project_scope = has_our_binary(
+        code_cfg
+            .as_ref()
+            .and_then(|v| v.get("projects"))
+            .and_then(|p| p.get(&home))
+            .and_then(|h| h.get("mcpServers")),
+        &binary,
+    );
+    let code_installed = code_user_scope || code_project_scope;
 
     Ok(serde_json::json!({
         "claudeDesktop": desktop_installed,
