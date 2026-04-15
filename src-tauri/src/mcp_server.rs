@@ -335,12 +335,12 @@ impl McpServer {
         let mut conn = config.get_active_connection()
             .ok_or_else(|| "No active connection.\nOpen the pg-mcp UI and activate a connection, or run:\n  pg-mcp activate <connection-name>".to_string())?
             .clone();
-        // Pull password / connection string out of the OS keychain. If the
-        // keychain is unavailable the fields stay empty and Postgres will
-        // return a normal auth failure.
-        conn.hydrate_secrets();
         let needs_connect = self.db.active_name().await.as_deref() != Some(&conn.name);
         if needs_connect {
+            // Only touch the keychain when we actually need to open a new
+            // connection. Hydrating on every tool call generated a macOS
+            // keychain prompt per query.
+            conn.hydrate_secrets();
             self.db.connect(&conn).await?;
         }
         Ok(conn)
