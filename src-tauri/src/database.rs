@@ -67,6 +67,17 @@ impl DatabaseManager {
         *self.active_connection_name.lock().await = Some(conn.name.clone());
         *self.in_transaction.lock().await = false;
         *self.redact_pii.lock().await = conn.redact_pii;
+        crate::audit::log(
+            "db_connected",
+            serde_json::json!({
+                "connection": conn.name,
+                "host": conn.host,
+                "database": conn.database,
+                "ssl": conn.ssl,
+                "readonly": conn.readonly,
+                "redact_pii": conn.redact_pii,
+            }),
+        );
         Ok(())
     }
 
@@ -781,6 +792,24 @@ impl DatabaseManager {
         row_count: Option<usize>,
         error: Option<String>,
     ) {
+        let conn_name = self.active_connection_name.lock().await.clone();
+
+        // Persist to the shared audit log first so a crash between this
+        // call and in-memory insertion still leaves a trail.
+        crate::audit::log(
+            if error.is_some() { "query_error" } else { "query" },
+            serde_json::json!({
+                "connection": conn_name,
+                // Truncate very long SQL so the log file doesn't balloon
+                // on a pathological insert. Full text still lives in the
+                // in-memory ring for `query_history`.
+                "sql": truncate_for_log(sql, 4000),
+                "duration_ms": duration_ms as u64,
+                "rows": row_count,
+                "error": error,
+            }),
+        );
+
         let record = QueryRecord {
             sql: sql.to_string(),
             timestamp: chrono::Utc::now().naive_utc(),
@@ -882,7 +911,7 @@ async fn connect_client(conn: &Connection) -> Result<Client, String> {
         }
     };
 
-    harden_session(&client, conn.readonly).await?;
+    harden_session(&client, conn).await?;
     Ok(client)
 }
 
@@ -898,22 +927,36 @@ fn build_pg_config(conn: &Connection) -> PgConfig {
 }
 
 /// Apply per-session guardrails after connect:
+/// - application_name: tags the connection in `pg_stat_activity` as
+///   `pg-mcp/<session-uuid>/<connection-name>` so operators can tell
+///   concurrent agents apart
 /// - statement_timeout: bounds any single query
 /// - idle_in_transaction_session_timeout: prevents dangling txns locking rows
 /// - default_transaction_read_only: server-side readonly enforcement
 ///   (catches CTE writes, side-effecting functions, etc. that the client-side
 ///   keyword blocklist cannot)
-async fn harden_session(client: &Client, readonly: bool) -> Result<(), String> {
+async fn harden_session(client: &Client, conn: &Connection) -> Result<(), String> {
+    let app_name_raw = format!(
+        "pg-mcp/{}/{}",
+        crate::audit::session_id(),
+        conn.name
+    );
+    let app_name_escaped = app_name_raw.replace('\'', "''");
+
     let base = format!(
-        "SET statement_timeout = '{}'; SET idle_in_transaction_session_timeout = '{}';",
-        STATEMENT_TIMEOUT, IDLE_IN_TXN_TIMEOUT
+        "SET application_name = '{app}'; \
+         SET statement_timeout = '{st}'; \
+         SET idle_in_transaction_session_timeout = '{it}';",
+        app = app_name_escaped,
+        st = STATEMENT_TIMEOUT,
+        it = IDLE_IN_TXN_TIMEOUT,
     );
     client
         .batch_execute(&base)
         .await
-        .map_err(|e| format!("Failed to apply session timeouts: {}", e))?;
+        .map_err(|e| format!("Failed to apply session settings: {}", e))?;
 
-    if readonly {
+    if conn.readonly {
         client
             .batch_execute("SET default_transaction_read_only = on;")
             .await
@@ -1121,6 +1164,21 @@ fn get_cell_string(row: &Row, idx: usize, ty: &tokio_postgres::types::Type) -> S
             Ok(None) => "NULL".into(),
             Err(_) => "NULL".into(),
         },
+    }
+}
+
+fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        // Respect char boundaries so we don't produce invalid UTF-8.
+        let end = s
+            .char_indices()
+            .take_while(|(i, _)| *i < max)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!("{}…", &s[..end])
     }
 }
 

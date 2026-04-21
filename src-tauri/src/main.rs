@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audit;
 mod config;
 mod database;
 mod mcp_server;
@@ -56,6 +57,12 @@ async fn save_connection(connection: Connection) -> Result<SafeConfig, String> {
     conn.password.clear();
     conn.connection_string = None;
 
+    let is_new = config
+        .connections
+        .iter()
+        .all(|c| c.name != conn.name);
+
+    let name = conn.name.clone();
     if let Some(existing) = config.connections.iter_mut().find(|c| c.name == conn.name) {
         *existing = conn;
     } else {
@@ -68,6 +75,12 @@ async fn save_connection(connection: Connection) -> Result<SafeConfig, String> {
     }
 
     config.save()?;
+
+    audit::log(
+        if is_new { "connection_added" } else { "connection_updated" },
+        serde_json::json!({"connection": name}),
+    );
+
     Ok(SafeConfig::from(&config))
 }
 
@@ -89,6 +102,8 @@ async fn delete_connection(name: String) -> Result<SafeConfig, String> {
         log::warn!("[pg-mcp] failed to delete keychain entries for '{}': {}", name, e);
     }
 
+    audit::log("connection_deleted", serde_json::json!({"connection": name}));
+
     Ok(SafeConfig::from(&config))
 }
 
@@ -100,11 +115,23 @@ async fn set_active(name: String, state: State<'_, AppState>) -> Result<SafeConf
         return Err(format!("Connection '{}' not found", name));
     }
 
-    config.active_connection = Some(name);
+    let previous = config.active_connection.clone();
+    config.active_connection = Some(name.clone());
     config.save()?;
 
-    // Flush the database connection so the MCP server picks up the change
+    // Flush the UI's database connection. Running `pg-mcp serve` child
+    // processes pick up the switch on their next tool call by way of the
+    // `Config::load` they already do per-call — they compare
+    // `active_connection` against their currently-connected name and
+    // reconnect if it changed. Nothing we do here can interrupt an
+    // in-flight query in those children; the switch takes effect on the
+    // query *after* the one already running.
     state.db.disconnect().await;
+
+    audit::log(
+        "active_connection_changed",
+        serde_json::json!({"from": previous, "to": name}),
+    );
 
     Ok(SafeConfig::from(&config))
 }
@@ -338,10 +365,12 @@ fn main() {
 
     // "serve" subcommand: run MCP server over stdio (no UI)
     if args.get(1).map(|s| s.as_str()) == Some("serve") {
+        audit::init("mcp");
         let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
         rt.block_on(async {
             let server = McpServer::new();
             if let Err(e) = server.run().await {
+                audit::log("fatal", serde_json::json!({"error": e.clone()}));
                 eprintln!("MCP server error: {}", e);
                 std::process::exit(1);
             }
@@ -350,11 +379,29 @@ fn main() {
     }
 
     // Default: launch the Tauri UI
+    audit::init("ui");
+
     let state = AppState {
         db: Arc::new(DatabaseManager::new()),
     };
 
     tauri::Builder::default()
+        // Single-instance must be the *first* plugin so the secondary
+        // process exits before loading anything else. When a second
+        // launch is attempted (e.g. double-clicking the app in Finder)
+        // the callback fires in the already-running primary and we
+        // raise its window.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            audit::log("second_instance_focused", serde_json::json!({}));
+            // Raise every visible window — robust against the default
+            // label changing across Tauri versions.
+            for (_label, window) in app.webview_windows() {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
