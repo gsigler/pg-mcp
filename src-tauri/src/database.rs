@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use tokio_postgres::config::SslMode;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config as PgConfig, NoTls, Row};
 
@@ -1418,7 +1419,14 @@ impl DatabaseManager {
 async fn connect_client(conn: &Connection) -> Result<Client, String> {
     let cfg = build_connect_config(conn)?;
 
-    let client = if conn.ssl {
+    // Attempt TLS whenever the UI toggle is on *or* the parsed sslmode
+    // demands it. The second half matters for hosted Postgres like AWS
+    // RDS: users often paste a `postgresql://…?sslmode=require` URL
+    // without flipping the SSL toggle, and tokio-postgres rejects
+    // `Require` + NoTls with a terse "no tls" error.
+    let use_tls = conn.ssl || cfg.get_ssl_mode() == SslMode::Require;
+
+    let client = if use_tls {
         let tls = TlsConnector::builder()
             .build()
             .map_err(|e| format!("TLS setup failed: {}", e))?;
@@ -1426,7 +1434,7 @@ async fn connect_client(conn: &Connection) -> Result<Client, String> {
         let (c, h) = cfg
             .connect(tls)
             .await
-            .map_err(|e| format!("Connection failed (TLS): {}", e))?;
+            .map_err(|e| format!("Connection failed (TLS): {}", hint_ssl_error(&e.to_string(), conn)))?;
         tokio::spawn(async move {
             if let Err(e) = h.await {
                 log::error!("Connection error: {}", e);
@@ -1437,7 +1445,7 @@ async fn connect_client(conn: &Connection) -> Result<Client, String> {
         let (c, h) = cfg
             .connect(NoTls)
             .await
-            .map_err(|e| format!("Connection failed: {}", e))?;
+            .map_err(|e| format!("Connection failed: {}", hint_ssl_error(&e.to_string(), conn)))?;
         tokio::spawn(async move {
             if let Err(e) = h.await {
                 log::error!("Connection error: {}", e);
@@ -1447,6 +1455,28 @@ async fn connect_client(conn: &Connection) -> Result<Client, String> {
     };
 
     Ok(client)
+}
+
+/// Append an actionable hint when the underlying error is the classic
+/// "server requires SSL but the client didn't offer it" shape. Hosted
+/// Postgres (AWS RDS, GCP Cloud SQL, Azure) rejects plaintext with this
+/// error and new users have no way to know the UI SSL toggle is the fix.
+fn hint_ssl_error(msg: &str, conn: &Connection) -> String {
+    let lower = msg.to_ascii_lowercase();
+    let looks_like_ssl_required = lower.contains("no encryption")
+        || lower.contains("ssl connection is required")
+        || lower.contains("ssl off")
+        || lower.contains("no tls")
+        || lower.contains("no pg_hba.conf entry");
+    if looks_like_ssl_required && !conn.ssl {
+        format!(
+            "{msg}\n\nThis server appears to require SSL. Enable the SSL \
+             toggle on this connection (or add `sslmode=require` to your \
+             connection string) and try again."
+        )
+    } else {
+        msg.to_string()
+    }
 }
 
 /// Build the `tokio_postgres::Config` we'll connect with. Either parses
@@ -1464,7 +1494,15 @@ async fn connect_client(conn: &Connection) -> Result<Client, String> {
 /// we run DISCARD ALL + re-harden after each query.
 fn build_connect_config(conn: &Connection) -> Result<PgConfig, String> {
     let mut cfg: PgConfig = if let Some(ref cs) = conn.connection_string {
-        cs.parse::<PgConfig>()
+        // AWS RDS docs and the `psql` CLI commonly use `sslmode=verify-ca`
+        // or `sslmode=verify-full`, but tokio-postgres 0.7 only accepts
+        // `disable|prefer|require`. Rewrite the stricter modes to
+        // `require` before parsing — `native-tls` already performs full
+        // CA + hostname verification by default, so the effective
+        // security level is unchanged.
+        let normalized = normalize_sslmode_param(cs);
+        normalized
+            .parse::<PgConfig>()
             .map_err(|e| format!("Invalid connection string: {}", e))?
     } else {
         let mut c = PgConfig::new();
@@ -1497,6 +1535,38 @@ fn build_connect_config(conn: &Connection) -> Result<PgConfig, String> {
     }
 
     Ok(cfg)
+}
+
+/// Rewrite `sslmode=verify-ca` / `sslmode=verify-full` to `sslmode=require`
+/// inside a connection string, leaving everything else untouched.
+/// tokio-postgres 0.7 only accepts `disable|prefer|require` and rejects
+/// the verify-* variants with an "Invalid value" error, even though
+/// AWS RDS and the libpq CLI treat them as the canonical "secure" modes.
+/// `native-tls` already performs full CA + hostname verification by
+/// default, so mapping to `require` preserves the user's intent.
+fn normalize_sslmode_param(cs: &str) -> String {
+    let lower = cs.to_ascii_lowercase();
+    let key = "sslmode=";
+    let mut out = String::with_capacity(cs.len());
+    let mut copied = 0;
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find(key) {
+        let key_start = search_from + rel;
+        let value_start = key_start + key.len();
+        let value_end = cs[value_start..]
+            .find(|c: char| c == ' ' || c == '\t' || c == '&' || c == '\n' || c == '\r')
+            .map(|p| value_start + p)
+            .unwrap_or(cs.len());
+        let value = &cs[value_start..value_end];
+        if value.eq_ignore_ascii_case("verify-ca") || value.eq_ignore_ascii_case("verify-full") {
+            out.push_str(&cs[copied..value_start]);
+            out.push_str("require");
+            copied = value_end;
+        }
+        search_from = value_end;
+    }
+    out.push_str(&cs[copied..]);
+    out
 }
 
 /// Apply per-session guardrails after connect:
@@ -1836,5 +1906,50 @@ mod tests {
         for sql in ["SELECT 1", "INSERT INTO t VALUES (1)", "BEGIN"] {
             assert!(!DatabaseManager::check_session_mutating(sql), "should not flag: {}", sql);
         }
+    }
+
+    #[test]
+    fn normalize_sslmode_rewrites_verify_variants() {
+        let url = "postgresql://u:p@mydb.xyz.us-east-1.rds.amazonaws.com:5432/d?sslmode=verify-full";
+        assert_eq!(
+            normalize_sslmode_param(url),
+            "postgresql://u:p@mydb.xyz.us-east-1.rds.amazonaws.com:5432/d?sslmode=require"
+        );
+
+        let kv = "host=rds sslmode=verify-ca user=x";
+        assert_eq!(normalize_sslmode_param(kv), "host=rds sslmode=require user=x");
+
+        // Case-insensitive key, preserves casing of surrounding params.
+        let mixed = "HOST=rds SSLMODE=Verify-Full USER=x";
+        assert_eq!(normalize_sslmode_param(mixed), "HOST=rds SSLMODE=require USER=x");
+
+        // Multiple query params, trailing sslmode.
+        let multi = "postgresql://h/d?connect_timeout=10&sslmode=verify-ca";
+        assert_eq!(
+            normalize_sslmode_param(multi),
+            "postgresql://h/d?connect_timeout=10&sslmode=require"
+        );
+    }
+
+    #[test]
+    fn normalize_sslmode_leaves_supported_modes_alone() {
+        for cs in [
+            "postgresql://h/d?sslmode=require",
+            "postgresql://h/d?sslmode=prefer",
+            "postgresql://h/d?sslmode=disable",
+            "postgresql://h/d",
+            "host=h user=u",
+        ] {
+            assert_eq!(normalize_sslmode_param(cs), cs, "should pass through: {}", cs);
+        }
+    }
+
+    #[test]
+    fn normalize_sslmode_result_parses() {
+        let rewritten =
+            normalize_sslmode_param("postgresql://u:p@h:5432/d?sslmode=verify-full");
+        rewritten
+            .parse::<PgConfig>()
+            .expect("rewritten connection string should parse");
     }
 }
