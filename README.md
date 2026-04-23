@@ -104,4 +104,4 @@ Releases are cut by pushing a `v*` tag; the GitHub Actions workflow builds a uni
 
 ## License
 
-TBD.
+MIT. See [LICENSE](LICENSE).
