@@ -25,9 +25,17 @@ agent is pointed at.
 
 Grab the macOS `.dmg` or Windows `.msi` from the latest [release](https://github.com/gsigler/pg-mcp/releases) and run the installer.
 
-### Register with Claude
+### Register with your agent
 
-Open pg-mcp, configure a connection, then click **Install in Claude Desktop** or **Install in Claude Code**. The app writes the correct stdio registration to the platform-appropriate config file (user-scope for Claude Code) and you restart the target.
+Open pg-mcp, configure a connection, then use the Agent Setup panel to one-click install into:
+
+- **Claude Desktop** → `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Claude Code** → `~/.claude.json` (user scope)
+- **Cursor** → `~/.cursor/mcp.json`
+- **VS Code** → `~/Library/Application Support/Code/User/mcp.json` (note: VS Code uses `servers`, not `mcpServers`, and entries need `"type": "stdio"`)
+- **Codex** → `~/.codex/config.toml` (one file covers the Codex CLI, IDE extension, and standalone desktop app)
+
+Restart the target after installing. For Zed, Cline, or anything else, expand **Manual setup / other clients** for copy-paste snippets.
 
 ### Build from source
 
@@ -48,10 +56,13 @@ Every response begins with a banner naming the active connection, its host, read
 | Tool | What it does |
 |---|---|
 | `list_connections` | All configured connections, marking the active one. |
+| `db_overview` | Single-call orientation: version, schemas, top N tables by size with column summary + 3-row samples, FK summary. Call this first on an unfamiliar DB. |
+| `search_schema` | Ranked search over table and column names + comments. Use when you know WHAT you're looking for but not WHERE it lives. |
 | `query` | Run raw SQL. Blocked on read-only connections for write statements. Supports `limit` / `offset` for pagination. |
 | `list_tables` | Tables and views by schema. Optional approximate row counts. |
 | `list_schemas` | Non-system schemas with table/view counts. |
-| `describe_table` | Columns (with comments), indexes, outgoing + incoming foreign keys, approximate row count, JSONB key sampling. |
+| `describe_table` | Columns (with comments), indexes, outgoing + incoming foreign keys, approximate row count, JSONB key sampling. `format: "brief"` collapses to a two-line `col:type PK →fk` summary. |
+| `describe_tables` | Brief-mode describe for an array of tables in one call. Batch sibling of `describe_table`. |
 | `get_table_sample` | Up to 50 sample rows. |
 | `get_schema_diagram` | Text ER diagram. |
 | `test_connection` | Version + latency probe. |

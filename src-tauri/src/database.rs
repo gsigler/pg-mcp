@@ -14,14 +14,23 @@ const STATEMENT_TIMEOUT: &str = "30s";
 const IDLE_IN_TXN_TIMEOUT: &str = "60s";
 
 /// Best-effort keyword blocklist. This is a UX fast-fail only — real
-/// readonly enforcement happens server-side via
-/// `SET default_transaction_read_only = on` applied at connect time.
+/// readonly enforcement is server-side: `default_transaction_read_only=on`
+/// is injected into the libpq startup `options` so Postgres applies it
+/// before any SQL runs and resists client-side SET overrides.
 const WRITE_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE",
     "GRANT", "REVOKE", "COPY", "VACUUM", "REINDEX", "COMMENT", "SECURITY",
 ];
 
 const WRITE_COMPOUND_KEYWORDS: &[&str] = &["SET ROLE", "RESET ROLE"];
+
+/// Statements that mutate session state. Blocked on read-only connections
+/// because they can relax the session's default transaction mode or wipe
+/// our hardening (`application_name`, timeouts). Enforcement still lives
+/// server-side — this is a clearer error than letting Postgres reject at
+/// statement time, and a backstop for GUCs whose `-c` startup value can
+/// be overridden by SET.
+const SESSION_MUTATING_KEYWORDS: &[&str] = &["SET", "RESET", "DISCARD"];
 
 /// Tracks queries executed in this session.
 #[derive(Clone)]
@@ -43,6 +52,17 @@ pub struct DatabaseManager {
     /// Introspection paths (describe_table, list_tables, etc.) skip
     /// redaction regardless — they only return metadata.
     redact_pii: Arc<Mutex<bool>>,
+    /// Config's `readonly` flag, snapshotted at connect time. Drives the
+    /// post-query DISCARD + re-harden cycle.
+    readonly: Arc<Mutex<bool>>,
+    /// What Postgres actually reports for `transaction_read_only` after
+    /// connect + hardening. Source of truth for the connection banner
+    /// icon — the config flag alone can lie if enforcement regressed.
+    observed_readonly: Arc<Mutex<bool>>,
+    /// `DISCARD ALL` + the full hardening SQL, memoized so post-query
+    /// reset on RO connections doesn't rebuild it each call. `None` on
+    /// read-write connections (no reset needed).
+    reset_sql: Arc<Mutex<Option<String>>>,
 }
 
 impl DatabaseManager {
@@ -53,6 +73,9 @@ impl DatabaseManager {
             in_transaction: Arc::new(Mutex::new(false)),
             query_history: Arc::new(Mutex::new(Vec::new())),
             redact_pii: Arc::new(Mutex::new(false)),
+            readonly: Arc::new(Mutex::new(false)),
+            observed_readonly: Arc::new(Mutex::new(false)),
+            reset_sql: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -60,13 +83,48 @@ impl DatabaseManager {
         self.active_connection_name.lock().await.clone()
     }
 
+    pub async fn observed_readonly(&self) -> bool {
+        *self.observed_readonly.lock().await
+    }
+
     pub async fn connect(&self, conn: &Connection) -> Result<(), String> {
         self.disconnect().await;
         let client = connect_client(conn).await?;
+
+        // Apply per-session guardrails. Returns the SQL that was applied
+        // so we can replay it after a post-query DISCARD ALL.
+        let hardening_sql = apply_hardening(&client, conn).await?;
+
+        // Verify the server is actually enforcing read-only for RO
+        // connections. `default_transaction_read_only` was injected via
+        // the startup `options` param, so a healthy server reports 'on'
+        // before any client SQL runs. Mismatch = enforcement regressed;
+        // refuse rather than lie on the banner.
+        let observed = query_transaction_read_only(&client).await?;
+        if conn.readonly && !observed {
+            return Err(
+                "Refusing connection: server reports transaction_read_only=off \
+                 even though this connection is configured read-only. \
+                 The startup `options` injection was not honored — likely a \
+                 server-side override (e.g. ALTER ROLE ... SET). Fix the role \
+                 or create a dedicated read-only role."
+                    .into(),
+            );
+        }
+
+        let reset_sql = if conn.readonly {
+            Some(format!("DISCARD ALL; {}", hardening_sql))
+        } else {
+            None
+        };
+
         *self.client.lock().await = Some(client);
         *self.active_connection_name.lock().await = Some(conn.name.clone());
         *self.in_transaction.lock().await = false;
         *self.redact_pii.lock().await = conn.redact_pii;
+        *self.readonly.lock().await = conn.readonly;
+        *self.observed_readonly.lock().await = observed;
+        *self.reset_sql.lock().await = reset_sql;
         crate::audit::log(
             "db_connected",
             serde_json::json!({
@@ -75,6 +133,7 @@ impl DatabaseManager {
                 "database": conn.database,
                 "ssl": conn.ssl,
                 "readonly": conn.readonly,
+                "observed_readonly": observed,
                 "redact_pii": conn.redact_pii,
             }),
         );
@@ -86,6 +145,34 @@ impl DatabaseManager {
         *self.active_connection_name.lock().await = None;
         *self.in_transaction.lock().await = false;
         *self.redact_pii.lock().await = false;
+        *self.readonly.lock().await = false;
+        *self.observed_readonly.lock().await = false;
+        *self.reset_sql.lock().await = None;
+    }
+
+    /// On read-only connections outside a user transaction, run DISCARD
+    /// ALL and re-apply the hardening SQL. Catches session-state mutation
+    /// that the classifier can't see (e.g. `SELECT set_config(...)` or
+    /// function side effects). No-op on RW or inside a user txn — DISCARD
+    /// isn't valid inside a transaction block.
+    async fn reset_if_readonly_outside_txn(&self) {
+        let readonly = *self.readonly.lock().await;
+        if !readonly {
+            return;
+        }
+        if *self.in_transaction.lock().await {
+            return;
+        }
+        let sql = match self.reset_sql.lock().await.clone() {
+            Some(s) => s,
+            None => return,
+        };
+        let guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            if let Err(e) = client.batch_execute(&sql).await {
+                log::warn!("[pg-mcp] post-query session reset failed: {}", e);
+            }
+        }
     }
 
     async fn get_client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Client>>, String> {
@@ -115,6 +202,20 @@ impl DatabaseManager {
         }
     }
 
+    /// True if the statement is a session-state mutation (`SET`, `RESET`,
+    /// `DISCARD`, including `SET SESSION` / `SET LOCAL`). These aren't
+    /// writes in the table-data sense, so they bypass `check_write_query`,
+    /// but on a read-only connection they're privileged — they can weaken
+    /// `default_transaction_read_only` or clear our hardening.
+    pub fn check_session_mutating(sql: &str) -> bool {
+        let normalized = sql.trim().to_uppercase();
+        if let Some(first_token) = normalized.split_whitespace().next() {
+            SESSION_MUTATING_KEYWORDS.contains(&first_token)
+        } else {
+            false
+        }
+    }
+
     // ─── Core query execution ──────────────────────────────────────
 
     pub async fn execute_query(
@@ -122,12 +223,23 @@ impl DatabaseManager {
         sql: &str,
         readonly: bool,
     ) -> Result<String, String> {
-        // Fast-fail UX check. Real enforcement is via session-level
-        // default_transaction_read_only applied at connect time.
+        // Fast-fail UX checks. Real enforcement is the startup-options
+        // `default_transaction_read_only=on` and the post-query session
+        // reset; these errors just produce clearer messages than letting
+        // Postgres reject at statement time.
         if readonly && Self::check_write_query(sql) {
             return Err(
                 "Write operation blocked. This connection is read-only.\n\
                  To enable writes, open pg-mcp UI and disable read-only mode for this connection."
+                    .into(),
+            );
+        }
+        if readonly && Self::check_session_mutating(sql) {
+            return Err(
+                "Session-mutating statement (SET/RESET/DISCARD) blocked on read-only \
+                 connections. These can weaken the guardrail they exist to enforce. \
+                 If you need to change a session parameter, switch to a read-write \
+                 connection in the pg-mcp UI."
                     .into(),
             );
         }
@@ -141,13 +253,18 @@ impl DatabaseManager {
     ) -> Result<String, String> {
         let start = Instant::now();
         let redact = *self.redact_pii.lock().await;
-        let guard = self.get_client().await?;
-        let client = guard.as_ref().unwrap();
 
-        let result = client.query(sql, params).await;
+        // Scope the client guard so it's dropped before the post-query
+        // reset reacquires the client mutex. `tokio::sync::Mutex` is not
+        // reentrant — holding it across the reset call would deadlock.
+        let result = {
+            let guard = self.get_client().await?;
+            let client = guard.as_ref().unwrap();
+            client.query(sql, params).await
+        };
         let duration_ms = start.elapsed().as_millis();
 
-        match result {
+        let response = match result {
             Ok(rows) => {
                 let row_count = rows.len();
                 self.record_query(sql, duration_ms, Some(row_count), None).await;
@@ -158,7 +275,10 @@ impl DatabaseManager {
                 self.record_query(sql, duration_ms, None, Some(err.clone())).await;
                 Err(err)
             }
-        }
+        };
+
+        self.reset_if_readonly_outside_txn().await;
+        response
     }
 
     /// Execute an UPDATE/DELETE (expected to return rows via RETURNING *)
@@ -286,32 +406,38 @@ impl DatabaseManager {
     }
 
     pub async fn commit_transaction(&self) -> Result<String, String> {
-        let guard = self.get_client().await?;
-        let client = guard.as_ref().unwrap();
-
         if !*self.in_transaction.lock().await {
             return Err("No active transaction to commit.".into());
         }
 
-        client.execute("COMMIT", &[]).await
-            .map_err(|e| format!("Failed to commit: {}", e))?;
+        {
+            let guard = self.get_client().await?;
+            let client = guard.as_ref().unwrap();
+            client.execute("COMMIT", &[]).await
+                .map_err(|e| format!("Failed to commit: {}", e))?;
+        }
 
         *self.in_transaction.lock().await = false;
+        // Post-txn reset: non-LOCAL `SET`s that somehow landed inside the
+        // txn remain in session scope after COMMIT. DISCARD ALL clears them.
+        self.reset_if_readonly_outside_txn().await;
         Ok("Transaction committed.".into())
     }
 
     pub async fn rollback_transaction(&self) -> Result<String, String> {
-        let guard = self.get_client().await?;
-        let client = guard.as_ref().unwrap();
-
         if !*self.in_transaction.lock().await {
             return Err("No active transaction to rollback.".into());
         }
 
-        client.execute("ROLLBACK", &[]).await
-            .map_err(|e| format!("Failed to rollback: {}", e))?;
+        {
+            let guard = self.get_client().await?;
+            let client = guard.as_ref().unwrap();
+            client.execute("ROLLBACK", &[]).await
+                .map_err(|e| format!("Failed to rollback: {}", e))?;
+        }
 
         *self.in_transaction.lock().await = false;
+        self.reset_if_readonly_outside_txn().await;
         Ok("Transaction rolled back.".into())
     }
 
@@ -455,7 +581,10 @@ impl DatabaseManager {
 
     // ─── Enhanced describe_table ───────────────────────────────────
 
-    pub async fn describe_table(&self, table: &str) -> Result<String, String> {
+    pub async fn describe_table(&self, table: &str, brief: bool) -> Result<String, String> {
+        if brief {
+            return self.describe_table_brief(table).await;
+        }
         let (schema, tbl) = split_qualified(table);
 
         let guard = self.get_client().await?;
@@ -596,6 +725,134 @@ impl DatabaseManager {
         Ok(output)
     }
 
+    /// Brief-mode describe: one row-count line + one compact column line
+    /// with PK/FK markers. Drops indexes, JSONB sampling, FK deep listing.
+    /// For "I just need column names" lookups and as the per-table piece
+    /// of `describe_tables`.
+    async fn describe_table_brief(&self, table: &str) -> Result<String, String> {
+        let (schema, tbl) = split_qualified(table);
+        let guard = self.get_client().await?;
+        let client = guard.as_ref().unwrap();
+
+        let meta = client
+            .query_opt(
+                "SELECT COALESCE(s.n_live_tup, 0)::bigint AS approx_rows, \
+                        obj_description(c.oid) AS description, \
+                        c.relkind \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                   AND c.relkind IN ('r','v','m','p','f')",
+                &[&schema, &tbl],
+            )
+            .await
+            .map_err(|e| format!("Query error: {}", e))?;
+
+        let (approx_rows, description, relkind): (i64, Option<String>, i8) = match meta {
+            Some(row) => (row.get(0), row.get(1), row.get::<_, i8>(2)),
+            None => {
+                return Err(format!(
+                    "Relation '{}.{}' not found. Check spelling or try search_schema.",
+                    schema, tbl
+                ))
+            }
+        };
+
+        let kind_label = match relkind as u8 as char {
+            'v' => " [view]",
+            'm' => " [matview]",
+            'p' => " [partitioned]",
+            'f' => " [foreign]",
+            _ => "",
+        };
+
+        let cols = client
+            .query(
+                "SELECT a.attname, \
+                        format_type(a.atttypid, a.atttypmod) AS type, \
+                        EXISTS ( \
+                            SELECT 1 FROM pg_constraint k \
+                            WHERE k.conrelid = a.attrelid \
+                              AND k.contype = 'p' \
+                              AND a.attnum = ANY(k.conkey) \
+                        ) AS is_pk, \
+                        ( \
+                            SELECT cn.nspname || '.' || cc.relname || '.' || att.attname \
+                            FROM pg_constraint k \
+                            JOIN pg_class cc ON cc.oid = k.confrelid \
+                            JOIN pg_namespace cn ON cn.oid = cc.relnamespace \
+                            JOIN pg_attribute att \
+                                ON att.attrelid = k.confrelid \
+                                AND att.attnum = k.confkey[array_position(k.conkey, a.attnum)] \
+                            WHERE k.conrelid = a.attrelid \
+                              AND k.contype = 'f' \
+                              AND a.attnum = ANY(k.conkey) \
+                            LIMIT 1 \
+                        ) AS fk_target \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
+                &[&schema, &tbl],
+            )
+            .await
+            .map_err(|e| format!("Query error: {}", e))?;
+
+        let mut output = format!("{}.{}{} (~{} rows)", schema, tbl, kind_label, approx_rows);
+        if let Some(d) = description.filter(|s| !s.is_empty()) {
+            let first = d.lines().next().unwrap_or(&d);
+            output.push_str(&format!(": {}", first));
+        }
+        output.push('\n');
+
+        if cols.is_empty() {
+            output.push_str("  (no columns)\n");
+        } else {
+            let parts: Vec<String> = cols
+                .iter()
+                .map(|r| {
+                    let cn: String = r.get(0);
+                    let ct: String = r.get(1);
+                    let is_pk: bool = r.get(2);
+                    let fk: Option<String> = r.get(3);
+                    let mut s = format!("{}:{}", cn, ct);
+                    if is_pk {
+                        s.push_str(" PK");
+                    }
+                    if let Some(t) = fk {
+                        s.push_str(&format!(" →{}", t));
+                    }
+                    s
+                })
+                .collect();
+            output.push_str(&format!("  {}\n", parts.join(", ")));
+        }
+        Ok(output)
+    }
+
+    /// Describe multiple tables in one call, each in brief form. Errors
+    /// on individual tables are emitted inline instead of aborting the
+    /// whole call — one bad name shouldn't waste the rest of the batch.
+    pub async fn describe_tables(&self, tables: &[String]) -> Result<String, String> {
+        if tables.is_empty() {
+            return Err("No tables provided.".into());
+        }
+        let mut output = String::new();
+        for (i, table) in tables.iter().enumerate() {
+            if i > 0 {
+                output.push('\n');
+            }
+            match self.describe_table_brief(table).await {
+                Ok(s) => output.push_str(&s),
+                Err(e) => output.push_str(&format!("{}: ERROR {}\n", table, e)),
+            }
+        }
+        Ok(output)
+    }
+
     // ─── Enhanced list_tables ──────────────────────────────────────
 
     pub async fn list_tables(
@@ -663,7 +920,7 @@ impl DatabaseManager {
 
     // ─── Other tools ───────────────────────────────────────────────
 
-    pub async fn test_connection(conn: &Connection) -> Result<(String, u128), String> {
+    pub async fn test_connection(conn: &Connection) -> Result<(String, u128, bool), String> {
         let start = Instant::now();
         let client = connect_client(conn).await?;
         let row = client
@@ -672,7 +929,8 @@ impl DatabaseManager {
             .map_err(|e| format!("Query failed: {}", e))?;
         let version: String = row.get(0);
         let latency = start.elapsed().as_millis();
-        Ok((version, latency))
+        let observed = query_transaction_read_only(&client).await.unwrap_or(false);
+        Ok((version, latency, observed))
     }
 
     pub async fn list_schemas(&self) -> Result<String, String> {
@@ -783,6 +1041,308 @@ impl DatabaseManager {
         Ok(diagram)
     }
 
+    // ─── Orientation tools ─────────────────────────────────────────
+
+    /// Single-call orientation package. Bundles what an agent otherwise
+    /// gets from `list_schemas` + `list_tables --include-counts` +
+    /// `describe_table` (xN) + `get_table_sample` (xN) into one response.
+    /// Sample rows respect the connection's PII redaction setting.
+    pub async fn db_overview(&self, top_n: usize) -> Result<String, String> {
+        let top_n = top_n.clamp(1, 50) as i64;
+        let redact = *self.redact_pii.lock().await;
+        let guard = self.get_client().await?;
+        let client = guard.as_ref().unwrap();
+
+        let mut output = String::new();
+
+        let hdr = client
+            .query_one("SELECT current_database(), version()", &[])
+            .await
+            .map_err(|e| format!("Query error: {}", e))?;
+        let db_name: String = hdr.get(0);
+        let version: String = hdr.get(1);
+        let short_ver = version.split(" on ").next().unwrap_or(&version);
+        output.push_str(&format!("DATABASE: {}\n  Version: {}\n", db_name, short_ver));
+
+        let schemas = client
+            .query(
+                "SELECT n.nspname, \
+                        COUNT(*) FILTER (WHERE c.relkind = 'r')::int8 AS tables, \
+                        COUNT(*) FILTER (WHERE c.relkind = 'v')::int8 AS views \
+                 FROM pg_namespace n \
+                 LEFT JOIN pg_class c ON c.relnamespace = n.oid \
+                 WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
+                   AND n.nspname NOT LIKE 'pg_temp%' \
+                   AND n.nspname NOT LIKE 'pg_toast_temp%' \
+                 GROUP BY n.nspname \
+                 ORDER BY n.nspname",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Query error: {}", e))?;
+        if !schemas.is_empty() {
+            let parts: Vec<String> = schemas
+                .iter()
+                .map(|r| {
+                    let n: String = r.get(0);
+                    let t: i64 = r.get(1);
+                    let v: i64 = r.get(2);
+                    format!("{}({}t,{}v)", n, t, v)
+                })
+                .collect();
+            output.push_str(&format!("  Schemas: {}\n\n", parts.join(", ")));
+        } else {
+            output.push('\n');
+        }
+
+        let top_tables = client
+            .query(
+                "SELECT n.nspname AS schema, c.relname AS name, \
+                        COALESCE(s.n_live_tup, 0)::bigint AS approx_rows, \
+                        pg_size_pretty(pg_total_relation_size(c.oid)) AS size, \
+                        obj_description(c.oid) AS description \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid \
+                 WHERE c.relkind = 'r' \
+                   AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
+                   AND n.nspname NOT LIKE 'pg_temp%' \
+                 ORDER BY pg_total_relation_size(c.oid) DESC NULLS LAST \
+                 LIMIT $1",
+                &[&top_n],
+            )
+            .await
+            .map_err(|e| format!("Query error: {}", e))?;
+
+        if top_tables.is_empty() {
+            output.push_str("No user tables found.\n");
+            return Ok(output);
+        }
+
+        output.push_str(&format!("TOP {} TABLES BY SIZE:\n", top_tables.len()));
+
+        for tbl in &top_tables {
+            let schema: String = tbl.get(0);
+            let name: String = tbl.get(1);
+            let approx_rows: i64 = tbl.get(2);
+            let size: String = tbl.get(3);
+            let description: Option<String> = tbl.get(4);
+
+            output.push_str(&format!(
+                "\n  {}.{} ({}, ~{} rows)\n",
+                schema, name, size, approx_rows
+            ));
+            if let Some(d) = description.filter(|s| !s.is_empty()) {
+                let first = d.lines().next().unwrap_or(&d);
+                output.push_str(&format!("    note: {}\n", first));
+            }
+
+            let cols = client
+                .query(
+                    "SELECT a.attname, \
+                            format_type(a.atttypid, a.atttypmod) AS type, \
+                            EXISTS ( \
+                                SELECT 1 FROM pg_constraint k \
+                                WHERE k.conrelid = a.attrelid \
+                                  AND k.contype = 'p' \
+                                  AND a.attnum = ANY(k.conkey) \
+                            ) AS is_pk, \
+                            ( \
+                                SELECT cn.nspname || '.' || cc.relname || '.' || att.attname \
+                                FROM pg_constraint k \
+                                JOIN pg_class cc ON cc.oid = k.confrelid \
+                                JOIN pg_namespace cn ON cn.oid = cc.relnamespace \
+                                JOIN pg_attribute att \
+                                    ON att.attrelid = k.confrelid \
+                                    AND att.attnum = k.confkey[array_position(k.conkey, a.attnum)] \
+                                WHERE k.conrelid = a.attrelid \
+                                  AND k.contype = 'f' \
+                                  AND a.attnum = ANY(k.conkey) \
+                                LIMIT 1 \
+                            ) AS fk_target \
+                     FROM pg_attribute a \
+                     JOIN pg_class c ON c.oid = a.attrelid \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = $1 AND c.relname = $2 \
+                       AND a.attnum > 0 AND NOT a.attisdropped \
+                     ORDER BY a.attnum",
+                    &[&schema, &name],
+                )
+                .await
+                .map_err(|e| format!("Query error: {}", e))?;
+
+            if !cols.is_empty() {
+                let parts: Vec<String> = cols
+                    .iter()
+                    .map(|r| {
+                        let cn: String = r.get(0);
+                        let ct: String = r.get(1);
+                        let is_pk: bool = r.get(2);
+                        let fk: Option<String> = r.get(3);
+                        let mut s = format!("{}:{}", cn, ct);
+                        if is_pk {
+                            s.push_str(" PK");
+                        }
+                        if let Some(t) = fk {
+                            s.push_str(&format!(" →{}", t));
+                        }
+                        s
+                    })
+                    .collect();
+                output.push_str(&format!("    cols: {}\n", parts.join(", ")));
+            }
+
+            let schema_q = quote_ident(&schema);
+            let tbl_q = quote_ident(&name);
+            let sample_sql = format!("SELECT * FROM {}.{} LIMIT 3", schema_q, tbl_q);
+            if let Ok(rows) = client.query(&sample_sql, &[]).await {
+                if !rows.is_empty() {
+                    output.push_str("    sample:\n");
+                    for line in format_rows_opt(&rows, redact).lines() {
+                        output.push_str("      ");
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                }
+            }
+        }
+
+        let fks = client
+            .query(
+                "SELECT n1.nspname || '.' || c1.relname AS tbl, \
+                        a1.attname AS col, \
+                        n2.nspname || '.' || c2.relname AS ref_tbl, \
+                        a2.attname AS ref_col \
+                 FROM pg_constraint k \
+                 JOIN pg_class c1 ON c1.oid = k.conrelid \
+                 JOIN pg_namespace n1 ON n1.oid = c1.relnamespace \
+                 JOIN pg_class c2 ON c2.oid = k.confrelid \
+                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace \
+                 JOIN pg_attribute a1 \
+                    ON a1.attrelid = k.conrelid AND a1.attnum = k.conkey[1] \
+                 JOIN pg_attribute a2 \
+                    ON a2.attrelid = k.confrelid AND a2.attnum = k.confkey[1] \
+                 WHERE k.contype = 'f' \
+                   AND n1.nspname NOT IN ('pg_catalog','information_schema') \
+                 ORDER BY c1.relname, a1.attname \
+                 LIMIT 30",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Query error: {}", e))?;
+        if !fks.is_empty() {
+            output.push_str("\nRELATIONSHIPS (first 30):\n");
+            for row in &fks {
+                let t: String = row.get(0);
+                let c: String = row.get(1);
+                let rt: String = row.get(2);
+                let rc: String = row.get(3);
+                output.push_str(&format!("  {}.{} → {}.{}\n", t, c, rt, rc));
+            }
+        }
+
+        drop(guard);
+        self.reset_if_readonly_outside_txn().await;
+        Ok(output)
+    }
+
+    /// Ranked ILIKE search across table names, column names, and their
+    /// comments. Lets an agent locate identifiers by concept instead of
+    /// guessing names + describing until it finds them.
+    pub async fn search_schema(&self, query: &str, limit: usize) -> Result<String, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("search query is empty".into());
+        }
+        let limit = limit.clamp(1, 100) as i64;
+        let guard = self.get_client().await?;
+        let client = guard.as_ref().unwrap();
+
+        let comment_pat = format!("%{}%", query);
+
+        let sql = "\
+            WITH hits AS ( \
+                SELECT 'table'::text AS kind, \
+                       n.nspname AS schema, \
+                       c.relname AS object, \
+                       NULL::text AS column, \
+                       obj_description(c.oid) AS comment, \
+                       (CASE WHEN lower(c.relname) = lower($1) THEN 100 \
+                             WHEN c.relname ILIKE $1 || '%' THEN 50 \
+                             WHEN c.relname ILIKE '%' || $1 || '%' THEN 20 \
+                             ELSE 0 END) \
+                     + (CASE WHEN obj_description(c.oid) ILIKE $2 THEN 5 ELSE 0 END) AS score \
+                FROM pg_class c \
+                JOIN pg_namespace n ON n.oid = c.relnamespace \
+                WHERE c.relkind IN ('r', 'v') \
+                  AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
+                UNION ALL \
+                SELECT 'column'::text, \
+                       n.nspname, \
+                       c.relname, \
+                       a.attname, \
+                       col_description(c.oid, a.attnum::int), \
+                       (CASE WHEN lower(a.attname) = lower($1) THEN 80 \
+                             WHEN a.attname ILIKE $1 || '%' THEN 40 \
+                             WHEN a.attname ILIKE '%' || $1 || '%' THEN 15 \
+                             ELSE 0 END) \
+                     + (CASE WHEN col_description(c.oid, a.attnum::int) ILIKE $2 THEN 3 ELSE 0 END) \
+                FROM pg_class c \
+                JOIN pg_namespace n ON n.oid = c.relnamespace \
+                JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+                WHERE c.relkind IN ('r', 'v') \
+                  AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
+            ) \
+            SELECT kind, schema, object, column, comment, score \
+            FROM hits \
+            WHERE score > 0 \
+            ORDER BY score DESC, kind, schema, object, column \
+            LIMIT $3";
+
+        let rows = client
+            .query(sql, &[&query, &comment_pat, &limit])
+            .await
+            .map_err(|e| format!("Query error: {}", e))?;
+
+        if rows.is_empty() {
+            return Ok(format!(
+                "No matches for '{}'. Try a shorter or different term.\n",
+                query
+            ));
+        }
+
+        let mut output = format!("Matches for '{}' ({} result{}):\n", query, rows.len(),
+            if rows.len() == 1 { "" } else { "s" });
+        for row in &rows {
+            let kind: String = row.get(0);
+            let schema: String = row.get(1);
+            let object: String = row.get(2);
+            let column: Option<String> = row.get(3);
+            let comment: Option<String> = row.get(4);
+
+            match kind.as_str() {
+                "column" => {
+                    let c = column.unwrap_or_default();
+                    output.push_str(&format!("  column  {}.{}.{}", schema, object, c));
+                }
+                _ => {
+                    output.push_str(&format!("  table   {}.{}", schema, object));
+                }
+            }
+            if let Some(c) = comment.filter(|s| !s.is_empty()) {
+                let first = c.lines().next().unwrap_or(&c);
+                let trimmed = if first.len() > 80 {
+                    format!("{}…", &first[..80])
+                } else {
+                    first.to_string()
+                };
+                output.push_str(&format!(" — {}", trimmed));
+            }
+            output.push('\n');
+        }
+        Ok(output)
+    }
+
     // ─── Query history ─────────────────────────────────────────────
 
     async fn record_query(
@@ -856,74 +1416,87 @@ impl DatabaseManager {
 // ─── Connection helpers ─────────────────────────────────────────────
 
 async fn connect_client(conn: &Connection) -> Result<Client, String> {
+    let cfg = build_connect_config(conn)?;
+
     let client = if conn.ssl {
         let tls = TlsConnector::builder()
             .build()
             .map_err(|e| format!("TLS setup failed: {}", e))?;
         let tls = MakeTlsConnector::new(tls);
-
-        if let Some(ref cs) = conn.connection_string {
-            let (c, h) = tokio_postgres::connect(cs, tls)
-                .await
-                .map_err(|e| format!("Connection failed (TLS): {}", e))?;
-            tokio::spawn(async move {
-                if let Err(e) = h.await {
-                    log::error!("Connection error: {}", e);
-                }
-            });
-            c
-        } else {
-            let cfg = build_pg_config(conn);
-            let (c, h) = cfg
-                .connect(tls)
-                .await
-                .map_err(|e| format!("Connection failed (TLS): {}", e))?;
-            tokio::spawn(async move {
-                if let Err(e) = h.await {
-                    log::error!("Connection error: {}", e);
-                }
-            });
-            c
-        }
+        let (c, h) = cfg
+            .connect(tls)
+            .await
+            .map_err(|e| format!("Connection failed (TLS): {}", e))?;
+        tokio::spawn(async move {
+            if let Err(e) = h.await {
+                log::error!("Connection error: {}", e);
+            }
+        });
+        c
     } else {
-        if let Some(ref cs) = conn.connection_string {
-            let (c, h) = tokio_postgres::connect(cs, NoTls)
-                .await
-                .map_err(|e| format!("Connection failed: {}", e))?;
-            tokio::spawn(async move {
-                if let Err(e) = h.await {
-                    log::error!("Connection error: {}", e);
-                }
-            });
-            c
-        } else {
-            let cfg = build_pg_config(conn);
-            let (c, h) = cfg
-                .connect(NoTls)
-                .await
-                .map_err(|e| format!("Connection failed: {}", e))?;
-            tokio::spawn(async move {
-                if let Err(e) = h.await {
-                    log::error!("Connection error: {}", e);
-                }
-            });
-            c
-        }
+        let (c, h) = cfg
+            .connect(NoTls)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
+        tokio::spawn(async move {
+            if let Err(e) = h.await {
+                log::error!("Connection error: {}", e);
+            }
+        });
+        c
     };
 
-    harden_session(&client, conn).await?;
     Ok(client)
 }
 
-fn build_pg_config(conn: &Connection) -> PgConfig {
-    let mut cfg = PgConfig::new();
-    cfg.host(&conn.host)
-        .port(conn.port)
-        .dbname(&conn.database)
-        .user(&conn.user)
-        .password(&conn.password)
-        .connect_timeout(std::time::Duration::from_secs(10));
-    cfg
+/// Build the `tokio_postgres::Config` we'll connect with. Either parses
+/// the user's connection string or assembles a Config from the discrete
+/// fields, then layers on our overrides — notably, for read-only
+/// connections, `default_transaction_read_only=on` in the libpq startup
+/// `options` parameter.
+///
+/// Putting readonly in `options` rather than as a post-connect `SET` means
+/// Postgres applies it before the first client statement runs. It's also
+/// harder for a later SET to flip: `-c` values become the session default,
+/// and `RESET default_transaction_read_only` brings you back to `on`
+/// rather than `off`. A malicious `SET` can still flip it temporarily
+/// (the GUC is USERSET), which is why the classifier blocks SET and why
+/// we run DISCARD ALL + re-harden after each query.
+fn build_connect_config(conn: &Connection) -> Result<PgConfig, String> {
+    let mut cfg: PgConfig = if let Some(ref cs) = conn.connection_string {
+        cs.parse::<PgConfig>()
+            .map_err(|e| format!("Invalid connection string: {}", e))?
+    } else {
+        let mut c = PgConfig::new();
+        c.host(&conn.host)
+            .port(conn.port)
+            .dbname(&conn.database)
+            .user(&conn.user)
+            .password(&conn.password);
+        c
+    };
+
+    if cfg.get_connect_timeout().is_none() {
+        cfg.connect_timeout(std::time::Duration::from_secs(10));
+    }
+
+    if conn.readonly {
+        let existing = cfg.get_options().unwrap_or("").trim().to_string();
+        let injection = "-c default_transaction_read_only=on";
+        let combined = if existing.is_empty() {
+            injection.to_string()
+        } else if existing.contains("default_transaction_read_only") {
+            // Leave a user-supplied setting alone — they may be doing
+            // something unusual on purpose. The connect-time SHOW check
+            // will catch it if the resulting state disagrees with our flag.
+            existing
+        } else {
+            format!("{} {}", existing, injection)
+        };
+        cfg.options(&combined);
+    }
+
+    Ok(cfg)
 }
 
 /// Apply per-session guardrails after connect:
@@ -932,10 +1505,15 @@ fn build_pg_config(conn: &Connection) -> PgConfig {
 ///   concurrent agents apart
 /// - statement_timeout: bounds any single query
 /// - idle_in_transaction_session_timeout: prevents dangling txns locking rows
-/// - default_transaction_read_only: server-side readonly enforcement
-///   (catches CTE writes, side-effecting functions, etc. that the client-side
-///   keyword blocklist cannot)
-async fn harden_session(client: &Client, conn: &Connection) -> Result<(), String> {
+///
+/// Returns the SQL that was executed so callers can replay it after a
+/// `DISCARD ALL` (which resets `application_name` and the timeouts along
+/// with everything else).
+///
+/// Server-side readonly enforcement is set at connect time via the startup
+/// `options` param (see `build_connect_config`) rather than here, so it
+/// applies before any SQL runs.
+async fn apply_hardening(client: &Client, conn: &Connection) -> Result<String, String> {
     let app_name_raw = format!(
         "pg-mcp/{}/{}",
         crate::audit::session_id(),
@@ -943,26 +1521,39 @@ async fn harden_session(client: &Client, conn: &Connection) -> Result<(), String
     );
     let app_name_escaped = app_name_raw.replace('\'', "''");
 
-    let base = format!(
+    // For RO connections we also re-assert `default_transaction_read_only`
+    // here so a `RESET` or `DISCARD ALL` followed by this SQL puts us
+    // back into the enforced state regardless of what the session default
+    // resolves to.
+    let ro_reassert = if conn.readonly {
+        " SET default_transaction_read_only = on;"
+    } else {
+        ""
+    };
+
+    let sql = format!(
         "SET application_name = '{app}'; \
          SET statement_timeout = '{st}'; \
-         SET idle_in_transaction_session_timeout = '{it}';",
+         SET idle_in_transaction_session_timeout = '{it}';{ro}",
         app = app_name_escaped,
         st = STATEMENT_TIMEOUT,
         it = IDLE_IN_TXN_TIMEOUT,
+        ro = ro_reassert,
     );
     client
-        .batch_execute(&base)
+        .batch_execute(&sql)
         .await
         .map_err(|e| format!("Failed to apply session settings: {}", e))?;
+    Ok(sql)
+}
 
-    if conn.readonly {
-        client
-            .batch_execute("SET default_transaction_read_only = on;")
-            .await
-            .map_err(|e| format!("Failed to apply readonly mode: {}", e))?;
-    }
-    Ok(())
+async fn query_transaction_read_only(client: &Client) -> Result<bool, String> {
+    let row = client
+        .query_one("SHOW transaction_read_only", &[])
+        .await
+        .map_err(|e| format!("Failed to verify transaction_read_only: {}", e))?;
+    let val: String = row.get(0);
+    Ok(val.eq_ignore_ascii_case("on"))
 }
 
 // ─── Identifier helpers ─────────────────────────────────────────────
@@ -1190,5 +1781,60 @@ fn try_get_opt<'a, T: std::fmt::Display + tokio_postgres::types::FromSql<'a>>(
         Ok(Some(v)) => v.to_string(),
         Ok(None) => "NULL".into(),
         Err(_) => "NULL".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifier_blocks_writes() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "  update t set x=1  ",
+            "DELETE FROM t",
+            "DROP TABLE t",
+            "CREATE TABLE t ()",
+            "set role admin",
+        ] {
+            assert!(DatabaseManager::check_write_query(sql), "should block: {}", sql);
+        }
+    }
+
+    #[test]
+    fn classifier_allows_reads_and_txn() {
+        for sql in [
+            "SELECT 1",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT foo",
+            "RELEASE SAVEPOINT foo",
+        ] {
+            assert!(!DatabaseManager::check_write_query(sql), "should allow: {}", sql);
+        }
+    }
+
+    #[test]
+    fn classifier_blocks_session_mutating() {
+        for sql in [
+            "SET default_transaction_read_only = off",
+            "set local statement_timeout = '0'",
+            "  SET SESSION x = 1",
+            "RESET ALL",
+            "DISCARD ALL",
+            "discard plans",
+        ] {
+            assert!(DatabaseManager::check_session_mutating(sql), "should block: {}", sql);
+        }
+    }
+
+    #[test]
+    fn classifier_allows_non_session_statements() {
+        for sql in ["SELECT 1", "INSERT INTO t VALUES (1)", "BEGIN"] {
+            assert!(!DatabaseManager::check_session_mutating(sql), "should not flag: {}", sql);
+        }
     }
 }

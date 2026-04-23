@@ -133,13 +133,29 @@ impl McpServer {
                     },
                     {
                         "name": "describe_table",
-                        "description": "Returns column definitions (with comments), indexes, outgoing AND incoming foreign keys, approximate row count, and JSONB column key inspection. Accepts schema-qualified names like 'public.users'.",
+                        "description": "Returns column definitions (with comments), indexes, outgoing AND incoming foreign keys, approximate row count, and JSONB column key inspection. Accepts schema-qualified names like 'public.users'. Set `format: \"brief\"` for a condensed one-table-two-lines view when you only need column names and types.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "table": { "type": "string", "description": "The table name, optionally schema-qualified (e.g. 'public.users')" }
+                                "table": { "type": "string", "description": "The table name, optionally schema-qualified (e.g. 'public.users')" },
+                                "format": { "type": "string", "enum": ["full", "brief"], "description": "Output detail level. 'full' (default) includes indexes, FKs, JSONB keys. 'brief' returns just row count + a compact col:type PK →fk line — ~10x shorter." }
                             },
                             "required": ["table"]
+                        }
+                    },
+                    {
+                        "name": "describe_tables",
+                        "description": "Brief-mode describe for multiple tables in a single call. Each table returns two lines: row count line + compact col:type PK →fk list. Use when you need structure on several tables at once (typical orientation pattern). One bad name emits 'ERROR' inline without aborting the batch.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "tables": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Table names, each optionally schema-qualified."
+                                }
+                            },
+                            "required": ["tables"]
                         }
                     },
                     {
@@ -274,6 +290,29 @@ impl McpServer {
                             },
                             "required": []
                         }
+                    },
+                    {
+                        "name": "db_overview",
+                        "description": "Compact single-call orientation package for the active database. Returns server version, schemas with table/view counts, the top N tables by size with column summary and 3-row samples, and a foreign key summary. Use this FIRST when starting work on an unfamiliar database — it bundles what would otherwise require list_schemas + list_tables + describe_table + get_table_sample across many calls. Sample rows respect PII redaction when enabled.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "top_n": { "type": "number", "description": "How many largest tables to include in the sample block. Default 10, max 50." }
+                            },
+                            "required": []
+                        }
+                    },
+                    {
+                        "name": "search_schema",
+                        "description": "Ranked search for tables, views, and columns by name and comment/description. Use when you know WHAT data you're looking for but not WHERE it lives (e.g. 'customer email', 'stripe_id', 'order_status'). Faster than guessing table names and running describe_table until something fits. Returns schema-qualified hits ready to pass to describe_table or query.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string", "description": "Search term — matches against table names, column names, and their comments via case-insensitive substring." },
+                                "limit": { "type": "number", "description": "Max hits to return. Default 25, max 100." }
+                            },
+                            "required": ["query"]
+                        }
                     }
                 ]
             }
@@ -294,6 +333,7 @@ impl McpServer {
             "query" => self.tool_query(&config, &arguments).await,
             "list_tables" => self.tool_list_tables(&config, &arguments).await,
             "describe_table" => self.tool_describe_table(&config, &arguments).await,
+            "describe_tables" => self.tool_describe_tables(&config, &arguments).await,
             "list_schemas" => self.tool_list_schemas(&config).await,
             "test_connection" => self.tool_test_connection(&config).await,
             "get_table_sample" => self.tool_get_table_sample(&config, &arguments).await,
@@ -306,6 +346,8 @@ impl McpServer {
             "rollback" => self.tool_rollback(&config).await,
             "explain_query" => self.tool_explain_query(&config, &arguments).await,
             "query_history" => self.tool_query_history(&arguments).await,
+            "db_overview" => self.tool_db_overview(&config, &arguments).await,
+            "search_schema" => self.tool_search_schema(&config, &arguments).await,
             _ => Err(format!("Unknown tool: {}", tool_name)),
         };
 
@@ -323,8 +365,20 @@ impl McpServer {
 
     // ─── Helpers ────────────────────────────────────────────────────
 
-    fn connection_banner(conn: &Connection) -> String {
-        let mode = if conn.readonly { "\u{1f512} READ-ONLY" } else { "\u{1f513} READ-WRITE" };
+    /// Build the header banner shown above every tool response.
+    ///
+    /// `observed_readonly` is what the server actually reports for
+    /// `transaction_read_only` after connect + hardening — trust it over
+    /// the config flag. If they disagree we surface that mismatch rather
+    /// than silently draw a lock icon the database can't honor.
+    fn connection_banner(conn: &Connection, observed_readonly: bool) -> String {
+        let mode = if observed_readonly {
+            "\u{1f512} READ-ONLY (server-enforced)"
+        } else if conn.readonly {
+            "\u{26a0}\u{fe0f}  READ-WRITE (configured read-only, BUT server reports writable — enforcement regressed)"
+        } else {
+            "\u{1f513} READ-WRITE"
+        };
         let bar = "\u{25a0}".repeat(51);
         let redact_line = if conn.redact_pii {
             format!("\n\u{25a0} \u{1f576}\u{fe0f}  PII REDACTION ON (values in email/phone/ssn/name-like columns and cells matching PII patterns are returned as [REDACTED])")
@@ -336,6 +390,13 @@ impl McpServer {
             bar = bar, name = conn.name, host = conn.host, port = conn.port,
             db = conn.database, mode = mode, redact = redact_line,
         )
+    }
+
+    /// Thin wrapper that reads the observed readonly state from the DB
+    /// manager and builds the banner — saves every tool method from
+    /// reaching into `self.db` directly.
+    async fn banner_for(&self, conn: &Connection) -> String {
+        Self::connection_banner(conn, self.db.observed_readonly().await)
     }
 
     async fn ensure_connected(&self, config: &Config) -> Result<Connection, String> {
@@ -376,7 +437,7 @@ impl McpServer {
         let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize);
         let offset = args.get("offset").and_then(|o| o.as_u64()).map(|o| o as usize);
 
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = if limit.is_some() || offset.is_some() {
             self.db.execute_query_paginated(sql, conn.readonly, limit.unwrap_or(100), offset.unwrap_or(0)).await?
         } else {
@@ -389,7 +450,7 @@ impl McpServer {
         let conn = self.ensure_connected(config).await?;
         let schema = args.get("schema").and_then(|s| s.as_str());
         let include_counts = args.get("include_counts").and_then(|b| b.as_bool()).unwrap_or(false);
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.list_tables(schema, include_counts).await?;
         Ok(format!("{}\n{}", banner, result))
     }
@@ -397,22 +458,44 @@ impl McpServer {
     async fn tool_describe_table(&self, config: &Config, args: &Value) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
         let table = args.get("table").and_then(|s| s.as_str()).ok_or("Missing required parameter: table")?;
-        let banner = Self::connection_banner(&conn);
-        let result = self.db.describe_table(table).await?;
+        let brief = match args.get("format").and_then(|s| s.as_str()) {
+            Some("brief") => true,
+            Some("full") | None => false,
+            Some(other) => return Err(format!("Unknown format '{}'. Use 'full' or 'brief'.", other)),
+        };
+        let banner = self.banner_for(&conn).await;
+        let result = self.db.describe_table(table, brief).await?;
+        Ok(format!("{}\n{}", banner, result))
+    }
+
+    async fn tool_describe_tables(&self, config: &Config, args: &Value) -> Result<String, String> {
+        let conn = self.ensure_connected(config).await?;
+        let tables: Vec<String> = args
+            .get("tables")
+            .and_then(|v| v.as_array())
+            .ok_or("Missing required parameter: tables (array of strings)")?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let banner = self.banner_for(&conn).await;
+        let result = self.db.describe_tables(&tables).await?;
         Ok(format!("{}\n{}", banner, result))
     }
 
     async fn tool_list_schemas(&self, config: &Config) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.list_schemas().await?;
         Ok(format!("{}\n{}", banner, result))
     }
 
     async fn tool_test_connection(&self, config: &Config) -> Result<String, String> {
         let conn = config.get_active_connection().ok_or("No active connection")?.clone();
-        let banner = Self::connection_banner(&conn);
-        let (version, latency) = DatabaseManager::test_connection(&conn).await?;
+        // test_connection opens a fresh client just for the ping, so the
+        // manager's cached observed_readonly (from the MCP session's own
+        // connection) may be stale. Use what this ping itself observed.
+        let (version, latency, observed_ro) = DatabaseManager::test_connection(&conn).await?;
+        let banner = Self::connection_banner(&conn, observed_ro);
         Ok(format!("{}\nConnection OK\nServer: {}\nLatency: {}ms", banner, version, latency))
     }
 
@@ -420,7 +503,7 @@ impl McpServer {
         let conn = self.ensure_connected(config).await?;
         let table = args.get("table").and_then(|s| s.as_str()).ok_or("Missing required parameter: table")?;
         let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize);
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.get_table_sample(table, limit).await?;
         Ok(format!("{}\n{}", banner, result))
     }
@@ -428,7 +511,7 @@ impl McpServer {
     async fn tool_get_schema_diagram(&self, config: &Config, args: &Value) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
         let schema = args.get("schema").and_then(|s| s.as_str());
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.get_schema_diagram(schema).await?;
         Ok(format!("{}\n{}", banner, result))
     }
@@ -453,7 +536,7 @@ impl McpServer {
                 r.as_array().map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             }).collect();
 
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.insert_rows(table, &columns, &rows).await?;
         Ok(format!("{}\n{}", banner, result))
     }
@@ -476,7 +559,7 @@ impl McpServer {
             .and_then(|v| v.as_u64())
             .ok_or("Missing: expected_max_rows (integer upper bound on affected rows)")?;
 
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self
             .db
             .update_rows(table, &set_columns, conditions, expected_max_rows)
@@ -497,7 +580,7 @@ impl McpServer {
             .and_then(|v| v.as_u64())
             .ok_or("Missing: expected_max_rows (integer upper bound on affected rows)")?;
 
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self
             .db
             .delete_rows(table, conditions, expected_max_rows)
@@ -513,21 +596,21 @@ impl McpServer {
         if !readonly && conn.readonly {
             return Err("Cannot start a read-write transaction on a read-only connection.".into());
         }
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.begin_transaction(readonly).await?;
         Ok(format!("{}\n{}", banner, result))
     }
 
     async fn tool_commit(&self, config: &Config) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.commit_transaction().await?;
         Ok(format!("{}\n{}", banner, result))
     }
 
     async fn tool_rollback(&self, config: &Config) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.rollback_transaction().await?;
         Ok(format!("{}\n{}", banner, result))
     }
@@ -538,7 +621,7 @@ impl McpServer {
         let conn = self.ensure_connected(config).await?;
         let sql = args.get("sql").and_then(|s| s.as_str()).ok_or("Missing: sql")?;
         let analyze = args.get("analyze").and_then(|b| b.as_bool()).unwrap_or(false);
-        let banner = Self::connection_banner(&conn);
+        let banner = self.banner_for(&conn).await;
         let result = self.db.explain_query(sql, analyze, conn.readonly).await?;
         Ok(format!("{}\n{}", banner, result))
     }
@@ -548,5 +631,24 @@ impl McpServer {
     async fn tool_query_history(&self, args: &Value) -> Result<String, String> {
         let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
         Ok(self.db.get_query_history(limit).await)
+    }
+
+    // ─── Orientation tools ─────────────────────────────────────────
+
+    async fn tool_db_overview(&self, config: &Config, args: &Value) -> Result<String, String> {
+        let conn = self.ensure_connected(config).await?;
+        let top_n = args.get("top_n").and_then(|n| n.as_u64()).unwrap_or(10) as usize;
+        let banner = self.banner_for(&conn).await;
+        let result = self.db.db_overview(top_n).await?;
+        Ok(format!("{}\n{}", banner, result))
+    }
+
+    async fn tool_search_schema(&self, config: &Config, args: &Value) -> Result<String, String> {
+        let conn = self.ensure_connected(config).await?;
+        let query = args.get("query").and_then(|s| s.as_str()).ok_or("Missing: query")?;
+        let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(25) as usize;
+        let banner = self.banner_for(&conn).await;
+        let result = self.db.search_schema(query, limit).await?;
+        Ok(format!("{}\n{}", banner, result))
     }
 }

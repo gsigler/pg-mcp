@@ -72,12 +72,16 @@ They never share memory. They share:
 
 ### Readonly enforcement
 
-Defense in depth, with the server as the source of truth:
+Defense in depth, with the server as the source of truth. The only *real* fix is a dedicated read-only Postgres ROLE with SELECT-only grants — that's a user-side setup we can't enforce from the app. Everything below is belt-and-suspenders on top of that:
 
 1. `check_write_query` inspects the first token of raw SQL. Fast-fail UX only; never rely on it.
-2. At connect time, RO connections get `SET default_transaction_read_only = on`. Postgres rejects CTE writes, side-effecting functions, etc. at the statement level.
-3. Tool-level gates: `insert_rows`/`update_rows`/`delete_rows` refuse to run on a connection flagged readonly in `config.json`.
-4. `explain_query` with `analyze=true` refuses if the underlying SQL looks like a write, so `EXPLAIN ANALYZE INSERT` can't sneak past readonly.
+2. `check_session_mutating` blocks `SET` / `RESET` / `DISCARD` (including `SET SESSION` / `SET LOCAL`) on RO connections. These aren't writes in the table-data sense, so they slipped past #1, but they can weaken the guardrail itself or clear our hardening.
+3. RO connections are opened with `options=-c default_transaction_read_only=on` in the libpq startup packet. Postgres applies it before the first client statement and a later `RESET` brings you back to `on`, not `off`. This is sturdier than a post-connect `SET`.
+4. On connect, we `SHOW transaction_read_only` and refuse the session if the server reports `off` for an RO-flagged connection. Either the role overrode us (`ALTER ROLE ... SET`) or the startup options were stripped.
+5. On RO connections, after each query (and after `commit`/`rollback`), we run `DISCARD ALL` + replay the hardening SQL. This nukes any lingering session state — e.g. a `SELECT set_config(...)` call that mutated a GUC without triggering the classifier.
+6. Tool-level gates: `insert_rows`/`update_rows`/`delete_rows` refuse to run on a connection flagged readonly in `config.json`.
+7. `explain_query` with `analyze=true` refuses if the underlying SQL looks like a write, so `EXPLAIN ANALYZE INSERT` can't sneak past readonly.
+8. The connection banner's lock icon is driven by `SHOW transaction_read_only` (cached from connect time), not the config flag. If enforcement regressed, the banner says so instead of lying.
 
 ### Identifier vs value safety
 

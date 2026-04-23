@@ -602,6 +602,14 @@ header h1 {
   color: var(--text-muted);
 }
 
+.snippet-path {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  word-break: break-all;
+}
+
 .snippet-block pre {
   background: var(--bg-root);
   border: 1px solid var(--border-subtle);

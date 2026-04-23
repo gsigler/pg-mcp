@@ -16,3 +16,7 @@ src-tauri/gen/
 .env
 .env.local
 *.log
+
+# Playwright screenshots from local UI verification
+.playwright-mcp/
+agent-setup-*.png
