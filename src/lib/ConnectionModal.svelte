@@ -92,6 +92,124 @@
   }
 
   let displayTestResult = $derived(localTestResult || testResult);
+
+  // When the user pastes a `postgres(ql)://…` URL into the connection-string
+  // field, decompose it into the manual fields below and clear the URL
+  // field. Two reasons:
+  //   1. Removes the ambiguity of "which set is the app actually using?" —
+  //      after a paste, only the manual fields hold state.
+  //   2. Lets the user see and tweak what was parsed (e.g. fix a port,
+  //      flip SSL) without re-editing the URL.
+  // Manual parser rather than `new URL` because non-special schemes like
+  // `postgresql:` are treated opaquely by the WHATWG URL parser.
+  function parseConnectionUrl(input) {
+    const cs = (input || "").trim();
+    if (!cs) return null;
+    const m = cs.match(/^(postgres(?:ql)?):\/\/(.*)$/i);
+    if (!m) return null;
+    let rest = m[2];
+
+    const fragIdx = rest.indexOf("#");
+    if (fragIdx !== -1) rest = rest.slice(0, fragIdx);
+
+    let query = "";
+    const qIdx = rest.indexOf("?");
+    if (qIdx !== -1) {
+      query = rest.slice(qIdx + 1);
+      rest = rest.slice(0, qIdx);
+    }
+
+    let pathPart = "";
+    const slashIdx = rest.indexOf("/");
+    if (slashIdx !== -1) {
+      pathPart = rest.slice(slashIdx + 1);
+      rest = rest.slice(0, slashIdx);
+    }
+
+    // Userinfo + hostport. `lastIndexOf('@')` is robust to '@' in passwords
+    // when the password contains a literal '@' (which RFC 3986 allows in
+    // userinfo as a sub-delim, though it's bad practice).
+    let userinfo = "";
+    let hostport = rest;
+    const atIdx = rest.lastIndexOf("@");
+    if (atIdx !== -1) {
+      userinfo = rest.slice(0, atIdx);
+      hostport = rest.slice(atIdx + 1);
+    }
+
+    let userPart = "";
+    let passPart = "";
+    if (userinfo) {
+      const cIdx = userinfo.indexOf(":");
+      if (cIdx !== -1) {
+        userPart = userinfo.slice(0, cIdx);
+        passPart = userinfo.slice(cIdx + 1);
+      } else {
+        userPart = userinfo;
+      }
+    }
+
+    let hostPart = hostport;
+    let portPart = "";
+    if (hostport.startsWith("[")) {
+      // IPv6: [::1]:5432
+      const closeIdx = hostport.indexOf("]");
+      if (closeIdx !== -1) {
+        hostPart = hostport.slice(1, closeIdx);
+        if (hostport[closeIdx + 1] === ":") {
+          portPart = hostport.slice(closeIdx + 2);
+        }
+      }
+    } else {
+      const colonIdx = hostport.lastIndexOf(":");
+      if (colonIdx !== -1 && /^\d+$/.test(hostport.slice(colonIdx + 1))) {
+        hostPart = hostport.slice(0, colonIdx);
+        portPart = hostport.slice(colonIdx + 1);
+      }
+    }
+
+    let params;
+    try {
+      params = new URLSearchParams(query);
+    } catch {
+      params = new URLSearchParams();
+    }
+    const sslmodeRaw = (params.get("sslmode") || "").toLowerCase();
+    const wantsSsl =
+      sslmodeRaw === "require" ||
+      sslmodeRaw === "verify-ca" ||
+      sslmodeRaw === "verify-full";
+
+    const safeDecode = (s) => {
+      if (!s) return "";
+      try {
+        return decodeURIComponent(s);
+      } catch {
+        return s;
+      }
+    };
+
+    return {
+      host: safeDecode(hostPart),
+      port: portPart ? Number(portPart) : null,
+      database: safeDecode(pathPart),
+      user: safeDecode(userPart),
+      password: safeDecode(passPart),
+      ssl: wantsSsl,
+    };
+  }
+
+  function importConnectionString() {
+    const parsed = parseConnectionUrl(connectionString);
+    if (!parsed) return;
+    if (parsed.host) host = parsed.host;
+    if (parsed.port) port = parsed.port;
+    if (parsed.database) database = parsed.database;
+    if (parsed.user) user = parsed.user;
+    if (parsed.password) password = parsed.password;
+    if (parsed.ssl) ssl = true;
+    connectionString = "";
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -132,17 +250,20 @@
     </div>
 
     <div class="form-group">
-      <label for="conn-string">Connection String</label>
+      <label for="conn-string">Paste Connection String</label>
       <input
         id="conn-string"
         type="text"
         bind:value={connectionString}
+        onchange={importConnectionString}
+        onpaste={() => setTimeout(importConnectionString, 0)}
         placeholder="postgresql://user:pass@host:5432/db"
       />
+      <div class="helper-text">Auto-fills the fields below.</div>
     </div>
 
     <div class="divider">
-      <span>or configure individually</span>
+      <span>connection details</span>
     </div>
 
     <div class="form-row">

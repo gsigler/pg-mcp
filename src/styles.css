@@ -388,6 +388,12 @@ header h1 {
   background: var(--border-subtle);
 }
 
+.helper-text {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 .name-row {
   align-items: flex-start;
 }

@@ -1501,6 +1501,13 @@ fn build_connect_config(conn: &Connection) -> Result<PgConfig, String> {
         // CA + hostname verification by default, so the effective
         // security level is unchanged.
         let normalized = normalize_sslmode_param(cs);
+        let (normalized, dropped) = strip_unsupported_url_query_params(&normalized);
+        if !dropped.is_empty() {
+            log::info!(
+                "Dropped unsupported connection-string params before parse: {:?}",
+                dropped
+            );
+        }
         normalized
             .parse::<PgConfig>()
             .map_err(|e| format!("Invalid connection string: {}", e))?
@@ -1567,6 +1574,88 @@ fn normalize_sslmode_param(cs: &str) -> String {
     }
     out.push_str(&cs[copied..]);
     out
+}
+
+/// Query params that tokio-postgres 0.7's URL parser accepts. Anything
+/// else makes it reject the whole string with a terse
+/// "invalid connection string".
+const TOKIO_POSTGRES_URL_PARAMS: &[&str] = &[
+    "user",
+    "password",
+    "dbname",
+    "options",
+    "application_name",
+    "sslmode",
+    "host",
+    "hostaddr",
+    "port",
+    "connect_timeout",
+    "tcp_user_timeout",
+    "keepalives",
+    "keepalives_idle",
+    "keepalives_interval",
+    "keepalives_retries",
+    "target_session_attrs",
+    "channel_binding",
+    "replication",
+    "load_balance_hosts",
+];
+
+/// Strip query params that tokio-postgres doesn't recognize from a
+/// URL-form connection string. libpq-based clients (psql, pgAdmin,
+/// TablePlus, DBeaver) silently ignore unknown params and routinely
+/// embed their own UI metadata (`statusColor=…`, `env=…`,
+/// `tLSMode=…`, etc.) when exporting a "copy connection string". Pasting
+/// such a URL here previously failed with `invalid connection string`
+/// even though the params are entirely cosmetic.
+///
+/// Only operates on URL form (`postgres://` / `postgresql://`) — libpq
+/// `key=value` form rarely carries vendor cruft and parsing it correctly
+/// would mean reimplementing libpq's quoting rules.
+fn strip_unsupported_url_query_params(cs: &str) -> (String, Vec<String>) {
+    let lower = cs.to_ascii_lowercase();
+    if !(lower.starts_with("postgres://") || lower.starts_with("postgresql://")) {
+        return (cs.to_string(), Vec::new());
+    }
+    let q_start = match cs.find('?') {
+        Some(i) => i,
+        None => return (cs.to_string(), Vec::new()),
+    };
+    let (head, query_with_q) = cs.split_at(q_start);
+    let query = &query_with_q[1..];
+    let (query, frag) = match query.find('#') {
+        Some(i) => (&query[..i], Some(&query[i..])),
+        None => (query, None),
+    };
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split('=').next().unwrap_or("");
+        let key_lower = key.to_ascii_lowercase();
+        if TOKIO_POSTGRES_URL_PARAMS.contains(&key_lower.as_str()) {
+            kept.push(pair);
+        } else {
+            dropped.push(key.to_string());
+        }
+    }
+
+    if dropped.is_empty() {
+        return (cs.to_string(), Vec::new());
+    }
+    let mut out = String::with_capacity(cs.len());
+    out.push_str(head);
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    if let Some(f) = frag {
+        out.push_str(f);
+    }
+    (out, dropped)
 }
 
 /// Apply per-session guardrails after connect:
@@ -1951,5 +2040,64 @@ mod tests {
         rewritten
             .parse::<PgConfig>()
             .expect("rewritten connection string should parse");
+    }
+
+    #[test]
+    fn strip_unsupported_url_params_drops_tableplus_export() {
+        // Real shape that TablePlus produces when copying a connection
+        // URL: a pile of UI metadata after the supported params.
+        let url = "postgresql://forge:p%3Fass@sandbox.cknd65yvnh3h.us-west-2.rds.amazonaws.com/swell?statusColor=686B6F&env=sandbox&name=Swell&tLSMode=0&usePrivateKey=false&safeModeLevel=0&advancedSafeModeLevel=0&driverVersion=0&lazyload=false";
+        let (out, dropped) = strip_unsupported_url_query_params(url);
+        assert_eq!(
+            out,
+            "postgresql://forge:p%3Fass@sandbox.cknd65yvnh3h.us-west-2.rds.amazonaws.com/swell"
+        );
+        assert!(dropped.contains(&"statusColor".to_string()));
+        assert!(dropped.contains(&"tLSMode".to_string()));
+        assert!(dropped.contains(&"lazyload".to_string()));
+        out.parse::<PgConfig>()
+            .expect("cleaned URL should parse");
+    }
+
+    #[test]
+    fn strip_unsupported_url_params_keeps_supported() {
+        let url = "postgresql://u:p@h:5432/d?sslmode=require&application_name=foo&statusColor=red";
+        let (out, dropped) = strip_unsupported_url_query_params(url);
+        assert_eq!(
+            out,
+            "postgresql://u:p@h:5432/d?sslmode=require&application_name=foo"
+        );
+        assert_eq!(dropped, vec!["statusColor".to_string()]);
+    }
+
+    #[test]
+    fn strip_unsupported_url_params_passthrough() {
+        // No query → nothing to do.
+        let url = "postgresql://u:p@h:5432/d";
+        let (out, dropped) = strip_unsupported_url_query_params(url);
+        assert_eq!(out, url);
+        assert!(dropped.is_empty());
+
+        // libpq key=value form → leave alone.
+        let kv = "host=h user=u dbname=d";
+        let (out, dropped) = strip_unsupported_url_query_params(kv);
+        assert_eq!(out, kv);
+        assert!(dropped.is_empty());
+
+        // All params supported → identical out.
+        let url = "postgresql://h/d?sslmode=require&connect_timeout=5";
+        let (out, dropped) = strip_unsupported_url_query_params(url);
+        assert_eq!(out, url);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn strip_unsupported_url_params_drops_trailing_question_mark_when_all_dropped() {
+        let url = "postgresql://h/d?statusColor=red&lazyload=false";
+        let (out, dropped) = strip_unsupported_url_query_params(url);
+        assert_eq!(out, "postgresql://h/d");
+        assert_eq!(dropped.len(), 2);
+        out.parse::<PgConfig>()
+            .expect("cleaned URL should parse");
     }
 }
