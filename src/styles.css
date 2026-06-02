@@ -322,7 +322,8 @@ header h1 {
 
 .form-group { margin-bottom: 10px; }
 
-.form-group label {
+.form-group label,
+.form-group .field-label {
   display: block;
   font-size: 10px;
   font-weight: 500;

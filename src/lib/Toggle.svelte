@@ -10,6 +10,7 @@
     class:on={checked}
     role="switch"
     aria-checked={checked}
+    aria-label={label}
     onclick={() => (checked = !checked)}
   >
     <span class="toggle-thumb"></span>

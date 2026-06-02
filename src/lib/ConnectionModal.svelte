@@ -233,8 +233,8 @@
         />
       </div>
       <div class="form-group">
-        <label>Color</label>
-        <div class="color-picker">
+        <div class="field-label" id="conn-color-label">Color</div>
+        <div class="color-picker" role="group" aria-labelledby="conn-color-label">
           {#each COLOR_PALETTE as c}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <button
