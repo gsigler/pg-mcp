@@ -5,6 +5,7 @@
 <label class="toggle-label">
   <span>{label}</span>
   <button
+    type="button"
     class="toggle-switch"
     class:on={checked}
     role="switch"

@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import Toggle from "./Toggle.svelte";
 
-  let { connectionName = null, onSave, onCancel, onTest, testResult = null } = $props();
+  let { connectionName = null, onSave, onCancel, testResult = null } = $props();
 
   const COLOR_PALETTE = [
     "#22c55e", // green
@@ -79,8 +79,7 @@
     if (!name.trim()) return;
     localTestResult = { loading: true };
     try {
-      await invoke("save_connection", { connection: buildConnection() });
-      const result = await invoke("test_connection_cmd", { name: name.trim() });
+      const result = await invoke("test_connection_details", { connection: buildConnection() });
       localTestResult = { success: true, message: result };
     } catch (e) {
       localTestResult = { success: false, message: String(e) };
@@ -92,6 +91,8 @@
   }
 
   let displayTestResult = $derived(localTestResult || testResult);
+  let isTesting = $derived(!!displayTestResult?.loading);
+  let hasConnectionName = $derived(!!name.trim());
 
   // When the user pastes a `postgres(ql)://…` URL into the connection-string
   // field, decompose it into the manual fields below and clear the URL
@@ -320,10 +321,14 @@
     {/if}
 
     <div class="modal-actions">
-      <button class="btn" onclick={handleTest}>Test</button>
+      <button type="button" class="btn" disabled={!hasConnectionName || isTesting} onclick={handleTest}>
+        {isTesting ? "Testing..." : "Test connection"}
+      </button>
       <div class="spacer"></div>
-      <button class="btn" onclick={onCancel}>Cancel</button>
-      <button class="btn btn-primary" onclick={handleSave}>Save</button>
+      <button type="button" class="btn" onclick={onCancel}>Cancel</button>
+      <button type="button" class="btn btn-primary" disabled={!hasConnectionName} onclick={handleSave}>
+        Save connection
+      </button>
     </div>
   </div>
 </div>

@@ -56,13 +56,18 @@
   <header>
     <h1>pg-mcp</h1>
     <div class="header-actions">
-      <button class="icon-btn" onclick={() => (showAgentSetup = !showAgentSetup)} title="Agent setup">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="3"/>
-          <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
-        </svg>
+      <button
+        type="button"
+        class="btn btn-small"
+        class:active={showAgentSetup}
+        aria-pressed={showAgentSetup}
+        onclick={() => (showAgentSetup = !showAgentSetup)}
+      >
+        {showAgentSetup ? "Hide agent setup" : "Agent setup"}
       </button>
-      <button class="btn btn-primary btn-small" onclick={handleAdd}>+ New</button>
+      <button type="button" class="btn btn-primary btn-small" onclick={handleAdd}>
+        New connection
+      </button>
     </div>
   </header>
 
@@ -89,7 +94,6 @@
       connectionName={editingConnection}
       onSave={handleSave}
       onCancel={() => { showModal = false; editingConnection = null; }}
-      onTest={handleTest}
       testResult={editingConnection ? testResults[editingConnection] : null}
     />
   {/if}

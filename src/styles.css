@@ -31,7 +31,12 @@ html, body {
   height: 100%;
 }
 
-button { font-family: inherit; }
+button {
+  font-family: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus { outline: none; }
 
 /* ─── Layout ───────────────────────────────────────────── */
 
@@ -110,25 +115,6 @@ header h1 {
   flex-shrink: 0;
 }
 
-.active-indicator {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 8px;
-  height: 8px;
-  margin-left: -4px;
-}
-
-.pulse-dot {
-  width: 8px;
-  height: 8px;
-  background: var(--green);
-  border-radius: 50%;
-  animation: pulse 2s ease-in-out infinite;
-  box-shadow: 0 0 8px rgba(52, 208, 88, 0.5);
-}
-
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.5; transform: scale(0.85); }
@@ -180,31 +166,34 @@ header h1 {
   background: rgba(240, 160, 48, 0.1);
 }
 
-.test-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
+.test-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
   flex-shrink: 0;
 }
 
-.test-dot.success { background: var(--green); }
-.test-dot.error { background: var(--red); }
-.test-dot.loading {
-  background: var(--text-muted);
-  animation: pulse 1s ease-in-out infinite;
+.status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
 }
+
+.test-status.success { color: var(--green); background: rgba(52, 208, 88, 0.08); }
+.test-status.error { color: var(--red); background: rgba(248, 81, 73, 0.08); }
+.test-status.loading .status-dot { animation: pulse 1s ease-in-out infinite; }
 
 .card-actions {
   display: flex;
   align-items: center;
-  gap: 2px;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-
-.connection-card:hover .card-actions,
-.connection-card.active .card-actions {
-  opacity: 1;
+  gap: 4px;
 }
 
 /* ─── Buttons ──────────────────────────────────────────── */
@@ -223,8 +212,19 @@ header h1 {
   white-space: nowrap;
 }
 
-.btn:hover { background: var(--bg-hover); border-color: #3a3a3f; }
+.btn:hover:not(:disabled) { background: var(--bg-hover); border-color: #3a3a3f; }
+.btn:focus-visible,
+.color-swatch:focus-visible,
+.toggle-switch:focus-visible {
+  box-shadow: 0 0 0 2px var(--bg-root), 0 0 0 4px rgba(240, 160, 48, 0.75);
+}
 .btn:disabled { opacity: 0.5; cursor: default; }
+
+.btn.active {
+  color: var(--accent);
+  border-color: rgba(240, 160, 48, 0.45);
+  background: rgba(240, 160, 48, 0.08);
+}
 
 .btn-primary {
   background: var(--accent);
@@ -233,38 +233,25 @@ header h1 {
   font-weight: 600;
 }
 
-.btn-primary:hover {
+.btn-primary:hover:not(:disabled) {
   background: #e09520;
   border-color: #e09520;
+}
+
+.btn-danger {
+  color: var(--red);
+  border-color: rgba(248, 81, 73, 0.25);
+}
+
+.btn-danger:hover:not(:disabled) {
+  color: var(--red);
+  background: rgba(248, 81, 73, 0.08);
+  border-color: rgba(248, 81, 73, 0.4);
 }
 
 .btn-small {
   padding: 5px 10px;
   font-size: 11px;
-}
-
-.icon-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  background: transparent;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  border-radius: 6px;
-  transition: background 0.12s, color 0.12s;
-}
-
-.icon-btn:hover {
-  background: var(--bg-elevated);
-  color: var(--text-primary);
-}
-
-.icon-btn.danger:hover {
-  color: var(--red);
-  background: rgba(248, 81, 73, 0.08);
 }
 
 /* ─── Empty State ──────────────────────────────────────── */
