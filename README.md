@@ -100,7 +100,29 @@ cd src-tauri && cargo test   # Rust unit tests (PII heuristics, etc.)
 cd src-tauri && cargo check  # Quick type check
 ```
 
-Releases are cut by pushing a `v*` tag; the GitHub Actions workflow builds a universal macOS `.dmg` and a Windows `.msi` and attaches them to a draft release. See `.github/workflows/release.yml`.
+## Release process
+
+Release builds are tag-driven. A version bump PR by itself does not start a release; the GitHub Actions workflow runs when a `v*` tag is pushed or when the workflow is dispatched manually.
+
+1. Bump the version in all app metadata:
+   - `package.json`
+   - `package-lock.json`
+   - `src-tauri/Cargo.toml`
+   - `src-tauri/Cargo.lock`
+   - `src-tauri/tauri.conf.json`
+2. Build and check locally:
+   ```sh
+   npm run build
+   cd src-tauri && cargo check
+   ```
+3. Merge the version bump to `main`.
+4. Tag the release commit and push the tag:
+   ```sh
+   git tag vX.Y.Z
+   git push origin main vX.Y.Z
+   ```
+5. Wait for the **Release** workflow to finish. It builds macOS universal and Windows x64 artifacts, then attaches them to a draft GitHub release.
+6. Review the draft release notes and assets in GitHub, then publish the release manually.
 
 ## License
 
