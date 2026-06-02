@@ -218,7 +218,12 @@ header h1 {
 .toggle-switch:focus-visible {
   box-shadow: 0 0 0 2px var(--bg-root), 0 0 0 4px rgba(240, 160, 48, 0.75);
 }
-.btn:disabled { opacity: 0.5; cursor: default; }
+.btn:disabled {
+  background: var(--bg-surface);
+  border-color: var(--border-subtle);
+  color: var(--text-muted);
+  cursor: default;
+}
 
 .btn.active {
   color: var(--accent);
