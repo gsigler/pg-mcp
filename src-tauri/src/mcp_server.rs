@@ -403,7 +403,19 @@ impl McpServer {
         let mut conn = config.get_active_connection()
             .ok_or_else(|| "No active connection.\nOpen the pg-mcp UI and activate a connection, or run:\n  pg-mcp activate <connection-name>".to_string())?
             .clone();
-        let needs_connect = self.db.active_name().await.as_deref() != Some(&conn.name);
+        let active_matches = self.db.active_name().await.as_deref() == Some(&conn.name);
+        let is_connected = self.db.is_connected().await;
+        if active_matches && !is_connected && self.db.in_transaction().await {
+            self.db.disconnect().await;
+            return Err(
+                "Database connection closed while a transaction was active. \
+                 PostgreSQL rolled that transaction back; start a new transaction \
+                 and retry the operation."
+                    .into(),
+            );
+        }
+
+        let needs_connect = !active_matches || !is_connected;
         if needs_connect {
             // Only touch the keychain when we actually need to open a new
             // connection. Hydrating on every tool call generated a macOS

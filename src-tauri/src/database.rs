@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, Config as PgConfig, NoTls, Row};
+use tokio_postgres::{Client, Config as PgConfig, Error as PgError, NoTls, Row};
 
 const MAX_RESULT_ROWS: usize = 100;
 const MAX_COLUMN_WIDTH: usize = 60;
@@ -86,6 +86,19 @@ impl DatabaseManager {
 
     pub async fn observed_readonly(&self) -> bool {
         *self.observed_readonly.lock().await
+    }
+
+    pub async fn is_connected(&self) -> bool {
+        self.client
+            .lock()
+            .await
+            .as_ref()
+            .map(|client| !client.is_closed())
+            .unwrap_or(false)
+    }
+
+    pub async fn in_transaction(&self) -> bool {
+        *self.in_transaction.lock().await
     }
 
     pub async fn connect(&self, conn: &Connection) -> Result<(), String> {
@@ -168,11 +181,17 @@ impl DatabaseManager {
             Some(s) => s,
             None => return,
         };
-        let guard = self.client.lock().await;
-        if let Some(client) = guard.as_ref() {
-            if let Err(e) = client.batch_execute(&sql).await {
-                log::warn!("[pg-mcp] post-query session reset failed: {}", e);
+        let reset_err = {
+            let guard = self.client.lock().await;
+            if let Some(client) = guard.as_ref() {
+                client.batch_execute(&sql).await.err()
+            } else {
+                None
             }
+        };
+        if let Some(e) = reset_err {
+            log::warn!("[pg-mcp] post-query session reset failed: {}", e);
+            self.clear_stale_client_after_error(&e).await;
         }
     }
 
@@ -274,6 +293,7 @@ impl DatabaseManager {
             Err(e) => {
                 let err = format!("Query error: {}", e);
                 self.record_query(sql, duration_ms, None, Some(err.clone())).await;
+                self.clear_stale_client_after_error(&e).await;
                 Err(err)
             }
         };
@@ -358,6 +378,8 @@ impl DatabaseManager {
                 let _ = client.batch_execute(&undo_sql).await;
                 let err = format!("Query error: {}", e);
                 self.record_query(sql, duration_ms, None, Some(err.clone())).await;
+                drop(guard);
+                self.clear_stale_client_after_error(&e).await;
                 Err(err)
             }
         }
@@ -1386,6 +1408,20 @@ impl DatabaseManager {
         }
     }
 
+    async fn clear_stale_client_after_error(&self, err: &PgError) {
+        let client_closed = self
+            .client
+            .lock()
+            .await
+            .as_ref()
+            .map(|client| client.is_closed())
+            .unwrap_or(false);
+        if client_closed || is_connection_closed_message(&err.to_string()) {
+            log::info!("[pg-mcp] clearing stale database connection after error: {}", err);
+            self.disconnect().await;
+        }
+    }
+
     pub async fn get_query_history(&self, limit: usize) -> String {
         let history = self.query_history.lock().await;
         if history.is_empty() {
@@ -1932,6 +1968,14 @@ fn truncate_for_log(s: &str, max: usize) -> String {
     }
 }
 
+fn is_connection_closed_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("connection closed")
+        || lower.contains("server closed the connection")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+}
+
 fn try_get_opt<'a, T: std::fmt::Display + tokio_postgres::types::FromSql<'a>>(
     row: &'a Row,
     idx: usize,
@@ -1994,6 +2038,25 @@ mod tests {
     fn classifier_allows_non_session_statements() {
         for sql in ["SELECT 1", "INSERT INTO t VALUES (1)", "BEGIN"] {
             assert!(!DatabaseManager::check_session_mutating(sql), "should not flag: {}", sql);
+        }
+    }
+
+    #[test]
+    fn connection_closed_classifier_matches_stale_client_errors() {
+        for msg in [
+            "connection closed",
+            "server closed the connection unexpectedly",
+            "Connection reset by peer",
+            "write failed: Broken pipe",
+        ] {
+            assert!(is_connection_closed_message(msg), "should match: {}", msg);
+        }
+
+        for msg in [
+            "db error: ERROR: syntax error at or near \"select\"",
+            "Query error: relation \"missing\" does not exist",
+        ] {
+            assert!(!is_connection_closed_message(msg), "should not match: {}", msg);
         }
     }
 
