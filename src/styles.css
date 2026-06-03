@@ -189,7 +189,6 @@ header h1 {
 
 .test-status.success { color: var(--green); background: rgba(52, 208, 88, 0.08); }
 .test-status.error { color: var(--red); background: rgba(248, 81, 73, 0.08); }
-.test-status.loading { color: var(--text-secondary); }
 
 .card-actions {
   display: flex;
@@ -224,14 +223,6 @@ header h1 {
   border-color: var(--border-subtle);
   color: var(--text-muted);
   cursor: default;
-}
-
-.btn.btn-busy,
-.btn.btn-busy:hover {
-  background: var(--bg-elevated);
-  border-color: var(--border);
-  color: var(--text-secondary);
-  cursor: progress;
 }
 
 .btn.active {
@@ -484,7 +475,6 @@ header h1 {
 
 .test-result-inline.success { color: var(--green); background: rgba(52, 208, 88, 0.08); }
 .test-result-inline.error { color: var(--red); background: rgba(248, 81, 73, 0.08); }
-.test-result-inline.loading { color: var(--text-muted); background: var(--bg-elevated); }
 
 .modal-actions {
   display: flex;

@@ -10,6 +10,7 @@
   let editingConnection = $state(null);
   let showAgentSetup = $state(false);
   let testResults = $state({});
+  let testingConnections = $state({});
 
   async function loadConfig() {
     config = await invoke("get_config");
@@ -30,12 +31,15 @@
   }
 
   async function handleTest(name) {
-    testResults = { ...testResults, [name]: { loading: true } };
+    if (testingConnections[name]) return;
+    testingConnections = { ...testingConnections, [name]: true };
     try {
       const result = await invoke("test_connection_cmd", { name });
       testResults = { ...testResults, [name]: { success: true, message: result } };
     } catch (e) {
       testResults = { ...testResults, [name]: { success: false, message: String(e) } };
+    } finally {
+      testingConnections = { ...testingConnections, [name]: false };
     }
   }
 
@@ -79,6 +83,7 @@
     <ConnectionList
       {config}
       {testResults}
+      {testingConnections}
       onActivate={handleActivate}
       onEdit={handleEdit}
       onDelete={handleDelete}

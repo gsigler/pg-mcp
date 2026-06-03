@@ -1,8 +1,8 @@
 <script>
-  let { config, testResults, onActivate, onEdit, onDelete, onTest, onAdd } = $props();
+  let { config, testResults, testingConnections, onActivate, onEdit, onDelete, onTest, onAdd } = $props();
 
-  function handleTestClick(name, result) {
-    if (result?.loading) return;
+  function handleTestClick(name, isTesting) {
+    if (isTesting) return;
     onTest(name);
   }
 </script>
@@ -20,6 +20,7 @@
     {#each config.connections as conn}
       {@const isActive = conn.name === config.activeConnection}
       {@const result = testResults[conn.name]}
+      {@const isTesting = testingConnections[conn.name]}
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
@@ -42,15 +43,12 @@
           class="test-status"
           class:idle={!result}
           class:success={result?.success}
-          class:error={result && !result.success && !result.loading}
-          class:loading={result?.loading}
+          class:error={result && !result.success}
           title={result?.message || "Connection not tested yet"}
           aria-live="polite"
         >
           <span class="status-dot"></span>
-          {#if result?.loading}
-            Testing
-          {:else if result?.success}
+          {#if result?.success}
             OK
           {:else if result}
             Failed
@@ -63,9 +61,8 @@
           <button
             type="button"
             class="btn btn-small"
-            class:btn-busy={result?.loading}
-            aria-disabled={result?.loading}
-            onclick={() => handleTestClick(conn.name, result)}
+            aria-disabled={isTesting}
+            onclick={() => handleTestClick(conn.name, isTesting)}
           >
             Test
           </button>

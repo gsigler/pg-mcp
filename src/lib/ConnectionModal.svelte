@@ -27,6 +27,7 @@
   let redactPii = $state(false);
   let color = $state(COLOR_PALETTE[0]);
   let localTestResult = $state(null);
+  let isTesting = $state(false);
 
   let isEdit = $derived(!!connectionName);
 
@@ -77,12 +78,14 @@
 
   async function handleTest() {
     if (!name.trim() || isTesting) return;
-    localTestResult = { loading: true };
+    isTesting = true;
     try {
       const result = await invoke("test_connection_details", { connection: buildConnection() });
       localTestResult = { success: true, message: result };
     } catch (e) {
       localTestResult = { success: false, message: String(e) };
+    } finally {
+      isTesting = false;
     }
   }
 
@@ -91,7 +94,6 @@
   }
 
   let displayTestResult = $derived(localTestResult || testResult);
-  let isTesting = $derived(!!displayTestResult?.loading);
   let hasConnectionName = $derived(!!name.trim());
 
   // When the user pastes a `postgres(ql)://…` URL into the connection-string
@@ -309,16 +311,11 @@
       <div
         class="test-result-inline"
         class:success={displayTestResult.success}
-        class:error={!displayTestResult.success && !displayTestResult.loading}
-        class:loading={displayTestResult.loading}
+        class:error={!displayTestResult.success}
         role="status"
         aria-live="polite"
       >
-        {#if displayTestResult.loading}
-          Testing connection...
-        {:else}
-          {displayTestResult.message}
-        {/if}
+        {displayTestResult.message}
       </div>
     {/if}
 
@@ -326,7 +323,6 @@
       <button
         type="button"
         class="btn"
-        class:btn-busy={isTesting}
         disabled={!hasConnectionName}
         aria-disabled={!hasConnectionName || isTesting}
         onclick={handleTest}
