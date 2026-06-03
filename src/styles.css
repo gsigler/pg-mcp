@@ -115,11 +115,6 @@ header h1 {
   flex-shrink: 0;
 }
 
-@keyframes pulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.5; transform: scale(0.85); }
-}
-
 .card-main {
   flex: 1;
   display: flex;
@@ -170,6 +165,8 @@ header h1 {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  justify-content: center;
+  width: 74px;
   padding: 2px 6px;
   border-radius: 999px;
   font-family: var(--font-mono);
@@ -177,6 +174,10 @@ header h1 {
   color: var(--text-muted);
   background: var(--bg-elevated);
   flex-shrink: 0;
+}
+
+.test-status.idle {
+  visibility: hidden;
 }
 
 .status-dot {
@@ -188,7 +189,7 @@ header h1 {
 
 .test-status.success { color: var(--green); background: rgba(52, 208, 88, 0.08); }
 .test-status.error { color: var(--red); background: rgba(248, 81, 73, 0.08); }
-.test-status.loading .status-dot { animation: pulse 1s ease-in-out infinite; }
+.test-status.loading { color: var(--text-secondary); }
 
 .card-actions {
   display: flex;
@@ -223,6 +224,13 @@ header h1 {
   border-color: var(--border-subtle);
   color: var(--text-muted);
   cursor: default;
+}
+
+.btn.btn-busy:disabled {
+  background: var(--bg-elevated);
+  border-color: var(--border);
+  color: var(--text-secondary);
+  cursor: progress;
 }
 
 .btn.active {

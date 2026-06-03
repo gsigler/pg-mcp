@@ -321,8 +321,15 @@
     {/if}
 
     <div class="modal-actions">
-      <button type="button" class="btn" disabled={!hasConnectionName || isTesting} onclick={handleTest}>
-        {isTesting ? "Testing..." : "Test connection"}
+      <button
+        type="button"
+        class="btn"
+        class:btn-busy={isTesting}
+        disabled={!hasConnectionName || isTesting}
+        aria-busy={isTesting}
+        onclick={handleTest}
+      >
+        Test connection
       </button>
       <div class="spacer"></div>
       <button type="button" class="btn" onclick={onCancel}>Cancel</button>

@@ -33,34 +33,37 @@
           {conn.readonly ? "RO" : "RW"}
         </span>
 
-        {#if result}
-          <span
-            class="test-status"
-            class:success={result.success}
-            class:error={!result.success && !result.loading}
-            class:loading={result.loading}
-            title={result.message}
-          >
-            <span class="status-dot"></span>
-            {#if result.loading}
-              Testing
-            {:else if result.success}
-              OK
-            {:else}
-              Failed
-            {/if}
-          </span>
-        {/if}
+        <span
+          class="test-status"
+          class:idle={!result}
+          class:success={result?.success}
+          class:error={result && !result.success && !result.loading}
+          class:loading={result?.loading}
+          title={result?.message || "Connection not tested yet"}
+          aria-live="polite"
+        >
+          <span class="status-dot"></span>
+          {#if result?.loading}
+            Testing
+          {:else if result?.success}
+            OK
+          {:else if result}
+            Failed
+          {:else}
+            Not tested
+          {/if}
+        </span>
 
         <div class="card-actions" onclick={(e) => e.stopPropagation()}>
           <button
             type="button"
             class="btn btn-small"
+            class:btn-busy={result?.loading}
             disabled={result?.loading}
             aria-busy={result?.loading}
             onclick={() => onTest(conn.name)}
           >
-            {result?.loading ? "Testing" : "Test"}
+            Test
           </button>
           <button type="button" class="btn btn-small" onclick={() => onEdit(conn.name)}>
             Edit
