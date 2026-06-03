@@ -65,7 +65,6 @@
             class="btn btn-small"
             class:btn-busy={result?.loading}
             aria-disabled={result?.loading}
-            aria-busy={result?.loading}
             onclick={() => handleTestClick(conn.name, result)}
           >
             Test

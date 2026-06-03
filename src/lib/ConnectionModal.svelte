@@ -311,6 +311,8 @@
         class:success={displayTestResult.success}
         class:error={!displayTestResult.success && !displayTestResult.loading}
         class:loading={displayTestResult.loading}
+        role="status"
+        aria-live="polite"
       >
         {#if displayTestResult.loading}
           Testing connection...
@@ -327,7 +329,6 @@
         class:btn-busy={isTesting}
         disabled={!hasConnectionName}
         aria-disabled={!hasConnectionName || isTesting}
-        aria-busy={isTesting}
         onclick={handleTest}
       >
         Test connection
