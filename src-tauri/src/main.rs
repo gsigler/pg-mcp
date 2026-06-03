@@ -148,6 +148,36 @@ async fn test_connection_cmd(name: String) -> Result<String, String> {
 
     conn.hydrate_secrets();
     let (version, latency, observed_ro) = DatabaseManager::test_connection(&conn).await?;
+    Ok(format_connection_test_result(
+        &conn,
+        version,
+        latency,
+        observed_ro,
+    ))
+}
+
+#[tauri::command]
+async fn test_connection_details(mut connection: Connection) -> Result<String, String> {
+    connection.name = connection.name.trim().to_string();
+    if !connection.name.is_empty() {
+        connection.hydrate_secrets();
+    }
+
+    let (version, latency, observed_ro) = DatabaseManager::test_connection(&connection).await?;
+    Ok(format_connection_test_result(
+        &connection,
+        version,
+        latency,
+        observed_ro,
+    ))
+}
+
+fn format_connection_test_result(
+    conn: &Connection,
+    version: String,
+    latency: u128,
+    observed_ro: bool,
+) -> String {
     let ro_note = if conn.readonly && !observed_ro {
         " [WARNING: read-only not honored by server]"
     } else if observed_ro {
@@ -155,7 +185,7 @@ async fn test_connection_cmd(name: String) -> Result<String, String> {
     } else {
         ""
     };
-    Ok(format!("OK — {} ({}ms){}", version, latency, ro_note))
+    format!("OK — {} ({}ms){}", version, latency, ro_note)
 }
 
 #[tauri::command]
@@ -625,6 +655,7 @@ fn main() {
             delete_connection,
             set_active,
             test_connection_cmd,
+            test_connection_details,
             get_connection_for_edit,
             get_binary_path,
             add_to_claude_desktop,

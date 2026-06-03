@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import Toggle from "./Toggle.svelte";
 
-  let { connectionName = null, onSave, onCancel, onTest, testResult = null } = $props();
+  let { connectionName = null, onSave, onCancel, testResult = null } = $props();
 
   const COLOR_PALETTE = [
     "#22c55e", // green
@@ -27,6 +27,7 @@
   let redactPii = $state(false);
   let color = $state(COLOR_PALETTE[0]);
   let localTestResult = $state(null);
+  let isTesting = $state(false);
 
   let isEdit = $derived(!!connectionName);
 
@@ -76,14 +77,15 @@
   }
 
   async function handleTest() {
-    if (!name.trim()) return;
-    localTestResult = { loading: true };
+    if (!name.trim() || isTesting) return;
+    isTesting = true;
     try {
-      await invoke("save_connection", { connection: buildConnection() });
-      const result = await invoke("test_connection_cmd", { name: name.trim() });
+      const result = await invoke("test_connection_details", { connection: buildConnection() });
       localTestResult = { success: true, message: result };
     } catch (e) {
       localTestResult = { success: false, message: String(e) };
+    } finally {
+      isTesting = false;
     }
   }
 
@@ -92,6 +94,7 @@
   }
 
   let displayTestResult = $derived(localTestResult || testResult);
+  let hasConnectionName = $derived(!!name.trim());
 
   // When the user pastes a `postgres(ql)://…` URL into the connection-string
   // field, decompose it into the manual fields below and clear the URL
@@ -232,8 +235,8 @@
         />
       </div>
       <div class="form-group">
-        <label>Color</label>
-        <div class="color-picker">
+        <div class="field-label" id="conn-color-label">Color</div>
+        <div class="color-picker" role="group" aria-labelledby="conn-color-label">
           {#each COLOR_PALETTE as c}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <button
@@ -308,22 +311,29 @@
       <div
         class="test-result-inline"
         class:success={displayTestResult.success}
-        class:error={!displayTestResult.success && !displayTestResult.loading}
-        class:loading={displayTestResult.loading}
+        class:error={!displayTestResult.success}
+        role="status"
+        aria-live="polite"
       >
-        {#if displayTestResult.loading}
-          Testing connection...
-        {:else}
-          {displayTestResult.message}
-        {/if}
+        {displayTestResult.message}
       </div>
     {/if}
 
     <div class="modal-actions">
-      <button class="btn" onclick={handleTest}>Test</button>
+      <button
+        type="button"
+        class="btn"
+        disabled={!hasConnectionName}
+        aria-disabled={!hasConnectionName || isTesting}
+        onclick={handleTest}
+      >
+        Test connection
+      </button>
       <div class="spacer"></div>
-      <button class="btn" onclick={onCancel}>Cancel</button>
-      <button class="btn btn-primary" onclick={handleSave}>Save</button>
+      <button type="button" class="btn" onclick={onCancel}>Cancel</button>
+      <button type="button" class="btn btn-primary" disabled={!hasConnectionName} onclick={handleSave}>
+        Save connection
+      </button>
     </div>
   </div>
 </div>
