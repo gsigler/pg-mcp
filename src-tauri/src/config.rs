@@ -47,6 +47,21 @@ pub struct Connection {
 }
 
 impl Connection {
+    pub fn settings_signature(&self) -> String {
+        serde_json::json!({
+            "name": self.name,
+            "host": self.host,
+            "port": self.port,
+            "database": self.database,
+            "user": self.user,
+            "ssl": self.ssl,
+            "readonly": self.readonly,
+            "redact_pii": self.redact_pii,
+            "color": self.color,
+        })
+        .to_string()
+    }
+
     /// Fill `password` and `connection_string` from the OS keychain if they
     /// aren't already set in memory. Call this right before attempting a
     /// connect. Any keychain error is logged and the field stays empty;
@@ -216,8 +231,7 @@ impl Config {
             .map_err(|e| format!("Failed to serialize: {}", e))?;
 
         let tmp = path.with_extension("pgmcp.tmp");
-        fs::write(&tmp, &json)
-            .map_err(|e| format!("Failed to write temp config: {}", e))?;
+        fs::write(&tmp, &json).map_err(|e| format!("Failed to write temp config: {}", e))?;
 
         // Set perms on the temp file *before* the rename so there is
         // never a window where the permanent file exists with default

@@ -62,7 +62,9 @@ const REDACTED: &str = "[REDACTED]";
 /// True if the column name matches the PII heuristic.
 pub fn column_is_pii(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    PII_COLUMN_SUBSTRINGS.iter().any(|needle| n.contains(needle))
+    PII_COLUMN_SUBSTRINGS
+        .iter()
+        .any(|needle| n.contains(needle))
 }
 
 /// True if the value body matches an email / phone / SSN / CC pattern.
@@ -119,9 +121,8 @@ fn looks_like_phone(s: &str) -> bool {
     if !(10..=15).contains(&digits) {
         return false;
     }
-    s.chars().all(|c| {
-        c.is_ascii_digit() || matches!(c, '-' | ' ' | '+' | '(' | ')' | '.')
-    })
+    s.chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '-' | ' ' | '+' | '(' | ')' | '.'))
 }
 
 #[cfg(test)]

@@ -104,10 +104,7 @@ pub fn delete_password(connection_name: &str) -> Result<(), SecretError> {
 
 // ── Connection strings ─────────────────────────────────────────────
 
-pub fn save_connection_string(
-    connection_name: &str,
-    value: &str,
-) -> Result<(), SecretError> {
+pub fn save_connection_string(connection_name: &str, value: &str) -> Result<(), SecretError> {
     if value.is_empty() {
         return delete_connection_string(connection_name);
     }
