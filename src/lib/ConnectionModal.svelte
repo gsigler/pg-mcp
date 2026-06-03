@@ -76,7 +76,7 @@
   }
 
   async function handleTest() {
-    if (!name.trim()) return;
+    if (!name.trim() || isTesting) return;
     localTestResult = { loading: true };
     try {
       const result = await invoke("test_connection_details", { connection: buildConnection() });
@@ -325,7 +325,8 @@
         type="button"
         class="btn"
         class:btn-busy={isTesting}
-        disabled={!hasConnectionName || isTesting}
+        disabled={!hasConnectionName}
+        aria-disabled={!hasConnectionName || isTesting}
         aria-busy={isTesting}
         onclick={handleTest}
       >

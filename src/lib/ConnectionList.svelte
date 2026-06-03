@@ -1,5 +1,10 @@
 <script>
   let { config, testResults, onActivate, onEdit, onDelete, onTest, onAdd } = $props();
+
+  function handleTestClick(name, result) {
+    if (result?.loading) return;
+    onTest(name);
+  }
 </script>
 
 {#if config.connections.length === 0}
@@ -59,9 +64,9 @@
             type="button"
             class="btn btn-small"
             class:btn-busy={result?.loading}
-            disabled={result?.loading}
+            aria-disabled={result?.loading}
             aria-busy={result?.loading}
-            onclick={() => onTest(conn.name)}
+            onclick={() => handleTestClick(conn.name, result)}
           >
             Test
           </button>

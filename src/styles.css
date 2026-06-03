@@ -226,7 +226,8 @@ header h1 {
   cursor: default;
 }
 
-.btn.btn-busy:disabled {
+.btn.btn-busy,
+.btn.btn-busy:hover {
   background: var(--bg-elevated);
   border-color: var(--border);
   color: var(--text-secondary);
