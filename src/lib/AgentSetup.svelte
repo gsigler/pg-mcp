@@ -152,15 +152,15 @@ args = ["serve"]`,
         <div class="agent-card-info">
           <span class="agent-name">{agent.name}</span>
           {#if status[agent.id]}
-            <span class="badge-active">Connected</span>
+            <span class="badge-active">Added</span>
           {:else}
             <span class="badge-muted">Not connected</span>
           {/if}
         </div>
-        {#if status[agent.id]}
-          <button class="btn btn-small" disabled>Added</button>
-        {:else}
-          <button class="btn btn-small btn-primary" onclick={() => install(agent)}>Add</button>
+        {#if !status[agent.id]}
+          <button type="button" class="btn btn-small btn-primary" onclick={() => install(agent)}>
+            Add
+          </button>
         {/if}
       </div>
     {/each}
@@ -174,6 +174,7 @@ args = ["serve"]`,
           <div class="snippet-header">
             <span>{snippet.label}</span>
             <button
+              type="button"
               class="btn btn-small"
               onclick={() => copyToClipboard(snippet.body, snippet.id)}
             >
