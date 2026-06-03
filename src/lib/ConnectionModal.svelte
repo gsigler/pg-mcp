@@ -256,7 +256,7 @@
       <label for="conn-string">Paste Connection String</label>
       <input
         id="conn-string"
-        type="password"
+        type="text"
         bind:value={connectionString}
         onchange={(e) => importConnectionString(e)}
         onblur={(e) => importConnectionString(e)}
