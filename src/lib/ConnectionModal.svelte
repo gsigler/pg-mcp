@@ -49,7 +49,8 @@
       readonly = conn.readonly;
       redactPii = conn.redactPii ?? false;
       color = conn.color || COLOR_PALETTE[0];
-      connectionString = conn.connectionString || "";
+      password = "";
+      connectionString = "";
     } catch (e) {
       console.error("Failed to load connection:", e);
     }
@@ -202,8 +203,10 @@
     };
   }
 
-  function importConnectionString() {
-    const parsed = parseConnectionUrl(connectionString);
+  function importConnectionString(event = null) {
+    const input = event?.currentTarget;
+    const rawValue = input?.value ?? connectionString;
+    const parsed = parseConnectionUrl(rawValue);
     if (!parsed) return;
     if (parsed.host) host = parsed.host;
     if (parsed.port) port = parsed.port;
@@ -212,6 +215,7 @@
     if (parsed.password) password = parsed.password;
     if (parsed.ssl) ssl = true;
     connectionString = "";
+    if (input) input.value = "";
   }
 </script>
 
@@ -258,7 +262,8 @@
         id="conn-string"
         type="text"
         bind:value={connectionString}
-        onchange={importConnectionString}
+        onchange={(e) => importConnectionString(e)}
+        onblur={(e) => importConnectionString(e)}
         onpaste={() => setTimeout(importConnectionString, 0)}
         placeholder="postgresql://user:pass@host:5432/db"
       />

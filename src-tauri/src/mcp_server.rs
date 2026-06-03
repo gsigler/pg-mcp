@@ -1,5 +1,5 @@
 use crate::config::{Config, Connection};
-use crate::database::DatabaseManager;
+use crate::database::{DatabaseManager, MAX_EXPECTED_WRITE_ROWS};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -32,7 +32,11 @@ impl McpServer {
             let request: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[pg-mcp] Failed to parse JSON: {} — input: {}", e, line);
+                    eprintln!(
+                        "[pg-mcp] Failed to parse JSON: {}; input_len={}",
+                        e,
+                        line.len()
+                    );
                     continue;
                 }
             };
@@ -46,12 +50,13 @@ impl McpServer {
 
             let response_str =
                 serde_json::to_string(&response).map_err(|e| format!("Serialize error: {}", e))?;
-            stdout.write_all(response_str.as_bytes())
+            stdout
+                .write_all(response_str.as_bytes())
                 .map_err(|e| format!("Write error: {}", e))?;
-            stdout.write_all(b"\n")
+            stdout
+                .write_all(b"\n")
                 .map_err(|e| format!("Write error: {}", e))?;
-            stdout.flush()
-                .map_err(|e| format!("Flush error: {}", e))?;
+            stdout.flush().map_err(|e| format!("Flush error: {}", e))?;
         }
 
         Ok(())
@@ -113,8 +118,8 @@ impl McpServer {
                             "type": "object",
                             "properties": {
                                 "sql": { "type": "string", "description": "The SQL query to execute" },
-                                "limit": { "type": "number", "description": "Max rows to return (for pagination). Defaults to 100." },
-                                "offset": { "type": "number", "description": "Row offset (for pagination). Defaults to 0." }
+                                "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Max rows to return (for pagination). Defaults to 100." },
+                                "offset": { "type": "integer", "minimum": 0, "maximum": 10000000, "description": "Row offset (for pagination). Defaults to 0." }
                             },
                             "required": ["sql"]
                         }
@@ -228,8 +233,8 @@ impl McpServer {
                                     "additionalProperties": { "type": "string" },
                                     "description": "Column-value pairs to set. Use 'NULL', 'NOW()' etc. for special values."
                                 },
-                                "where": { "type": "string", "description": "WHERE condition (required). Use 'TRUE' to update all rows." },
-                                "expected_max_rows": { "type": "integer", "minimum": 0, "description": "Upper bound on the number of rows this UPDATE should touch. If the actual affected count exceeds this, the transaction is rolled back and an error is returned instead. Commit your intent explicitly — do not pass a very large value 'just in case'." }
+                                "where": { "type": "string", "description": "WHERE condition (required). Unconditional clauses like TRUE or 1=1 are blocked." },
+                                "expected_max_rows": { "type": "integer", "minimum": 0, "maximum": MAX_EXPECTED_WRITE_ROWS, "description": "Upper bound on the number of rows this UPDATE should touch. If the actual affected count exceeds this, the transaction is rolled back and an error is returned instead. Production safety cap applies." }
                             },
                             "required": ["table", "set", "where", "expected_max_rows"]
                         }
@@ -241,8 +246,8 @@ impl McpServer {
                             "type": "object",
                             "properties": {
                                 "table": { "type": "string", "description": "Target table name" },
-                                "where": { "type": "string", "description": "WHERE condition (required). Use 'TRUE' to delete all rows." },
-                                "expected_max_rows": { "type": "integer", "minimum": 0, "description": "Upper bound on the number of rows this DELETE should touch. If the actual affected count exceeds this, the transaction is rolled back and an error is returned instead. Commit your intent explicitly — do not pass a very large value 'just in case'." }
+                                "where": { "type": "string", "description": "WHERE condition (required). Unconditional clauses like TRUE or 1=1 are blocked." },
+                                "expected_max_rows": { "type": "integer", "minimum": 0, "maximum": MAX_EXPECTED_WRITE_ROWS, "description": "Upper bound on the number of rows this DELETE should touch. If the actual affected count exceeds this, the transaction is rolled back and an error is returned instead. Production safety cap applies." }
                             },
                             "required": ["table", "where", "expected_max_rows"]
                         }
@@ -275,7 +280,7 @@ impl McpServer {
                             "type": "object",
                             "properties": {
                                 "sql": { "type": "string", "description": "The SQL query to explain" },
-                                "analyze": { "type": "boolean", "description": "Run EXPLAIN ANALYZE (actually executes the query to get real timing). Default false." }
+                                "analyze": { "type": "boolean", "description": "Run EXPLAIN ANALYZE (actually executes the query to get real timing). Default false; blocked on read-only connections." }
                             },
                             "required": ["sql"]
                         }
@@ -404,6 +409,9 @@ impl McpServer {
             .ok_or_else(|| "No active connection.\nOpen the pg-mcp UI and activate a connection, or run:\n  pg-mcp activate <connection-name>".to_string())?
             .clone();
         let active_matches = self.db.active_name().await.as_deref() == Some(&conn.name);
+        let settings_signature = conn.settings_signature();
+        let settings_match = self.db.active_settings_signature().await.as_deref()
+            == Some(settings_signature.as_str());
         let is_connected = self.db.is_connected().await;
         if active_matches && !is_connected && self.db.in_transaction().await {
             self.db.disconnect().await;
@@ -415,7 +423,7 @@ impl McpServer {
             );
         }
 
-        let needs_connect = !active_matches || !is_connected;
+        let needs_connect = !active_matches || !is_connected || !settings_match;
         if needs_connect {
             // Only touch the keychain when we actually need to open a new
             // connection. Hydrating on every tool call generated a macOS
@@ -430,28 +438,52 @@ impl McpServer {
 
     async fn tool_list_connections(&self, config: &Config) -> Result<String, String> {
         if config.connections.is_empty() {
-            return Ok("No connections configured.\nOpen pg-mcp UI to add a database connection.".into());
+            return Ok(
+                "No connections configured.\nOpen pg-mcp UI to add a database connection.".into(),
+            );
         }
         let mut output = String::new();
         for conn in &config.connections {
-            let active = config.active_connection.as_deref().map_or(false, |a| a == conn.name);
+            let active = config
+                .active_connection
+                .as_deref()
+                .map_or(false, |a| a == conn.name);
             let mode = if conn.readonly { "RO" } else { "RW" };
             let marker = if active { " (active)" } else { "" };
-            output.push_str(&format!("- {}{} [{}] {}:{}/{}\n", conn.name, marker, mode, conn.host, conn.port, conn.database));
+            output.push_str(&format!(
+                "- {}{} [{}] {}:{}/{}\n",
+                conn.name, marker, mode, conn.host, conn.port, conn.database
+            ));
         }
         Ok(output)
     }
 
     async fn tool_query(&self, config: &Config, args: &Value) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let sql = args.get("sql").and_then(|s| s.as_str()).ok_or("Missing required parameter: sql")?;
+        let sql = args
+            .get("sql")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing required parameter: sql")?;
 
-        let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize);
-        let offset = args.get("offset").and_then(|o| o.as_u64()).map(|o| o as usize);
+        let limit = args
+            .get("limit")
+            .and_then(|l| l.as_u64())
+            .map(|l| l as usize);
+        let offset = args
+            .get("offset")
+            .and_then(|o| o.as_u64())
+            .map(|o| o as usize);
 
         let banner = self.banner_for(&conn).await;
         let result = if limit.is_some() || offset.is_some() {
-            self.db.execute_query_paginated(sql, conn.readonly, limit.unwrap_or(100), offset.unwrap_or(0)).await?
+            self.db
+                .execute_query_paginated(
+                    sql,
+                    conn.readonly,
+                    limit.unwrap_or(100),
+                    offset.unwrap_or(0),
+                )
+                .await?
         } else {
             self.db.execute_query(sql, conn.readonly).await?
         };
@@ -461,7 +493,10 @@ impl McpServer {
     async fn tool_list_tables(&self, config: &Config, args: &Value) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
         let schema = args.get("schema").and_then(|s| s.as_str());
-        let include_counts = args.get("include_counts").and_then(|b| b.as_bool()).unwrap_or(false);
+        let include_counts = args
+            .get("include_counts")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
         let banner = self.banner_for(&conn).await;
         let result = self.db.list_tables(schema, include_counts).await?;
         Ok(format!("{}\n{}", banner, result))
@@ -469,11 +504,19 @@ impl McpServer {
 
     async fn tool_describe_table(&self, config: &Config, args: &Value) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let table = args.get("table").and_then(|s| s.as_str()).ok_or("Missing required parameter: table")?;
+        let table = args
+            .get("table")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing required parameter: table")?;
         let brief = match args.get("format").and_then(|s| s.as_str()) {
             Some("brief") => true,
             Some("full") | None => false,
-            Some(other) => return Err(format!("Unknown format '{}'. Use 'full' or 'brief'.", other)),
+            Some(other) => {
+                return Err(format!(
+                    "Unknown format '{}'. Use 'full' or 'brief'.",
+                    other
+                ))
+            }
         };
         let banner = self.banner_for(&conn).await;
         let result = self.db.describe_table(table, brief).await?;
@@ -502,25 +545,42 @@ impl McpServer {
     }
 
     async fn tool_test_connection(&self, config: &Config) -> Result<String, String> {
-        let conn = config.get_active_connection().ok_or("No active connection")?.clone();
+        let mut conn = config
+            .get_active_connection()
+            .ok_or("No active connection")?
+            .clone();
+        conn.hydrate_secrets();
         // test_connection opens a fresh client just for the ping, so the
         // manager's cached observed_readonly (from the MCP session's own
         // connection) may be stale. Use what this ping itself observed.
         let (version, latency, observed_ro) = DatabaseManager::test_connection(&conn).await?;
         let banner = Self::connection_banner(&conn, observed_ro);
-        Ok(format!("{}\nConnection OK\nServer: {}\nLatency: {}ms", banner, version, latency))
+        Ok(format!(
+            "{}\nConnection OK\nServer: {}\nLatency: {}ms",
+            banner, version, latency
+        ))
     }
 
     async fn tool_get_table_sample(&self, config: &Config, args: &Value) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let table = args.get("table").and_then(|s| s.as_str()).ok_or("Missing required parameter: table")?;
-        let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize);
+        let table = args
+            .get("table")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing required parameter: table")?;
+        let limit = args
+            .get("limit")
+            .and_then(|l| l.as_u64())
+            .map(|l| l as usize);
         let banner = self.banner_for(&conn).await;
         let result = self.db.get_table_sample(table, limit).await?;
         Ok(format!("{}\n{}", banner, result))
     }
 
-    async fn tool_get_schema_diagram(&self, config: &Config, args: &Value) -> Result<String, String> {
+    async fn tool_get_schema_diagram(
+        &self,
+        config: &Config,
+        args: &Value,
+    ) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
         let schema = args.get("schema").and_then(|s| s.as_str());
         let banner = self.banner_for(&conn).await;
@@ -536,17 +596,30 @@ impl McpServer {
             return Err("Write operation blocked. This connection is read-only.".into());
         }
 
-        let table = args.get("table").and_then(|s| s.as_str()).ok_or("Missing: table")?;
-        let columns: Vec<String> = args.get("columns")
+        let table = args
+            .get("table")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing: table")?;
+        let columns: Vec<String> = args
+            .get("columns")
             .and_then(|a| a.as_array())
             .ok_or("Missing: columns")?
-            .iter().filter_map(|v| v.as_str().map(String::from)).collect();
-        let rows: Vec<Vec<String>> = args.get("rows")
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let rows: Vec<Vec<String>> = args
+            .get("rows")
             .and_then(|a| a.as_array())
             .ok_or("Missing: rows")?
-            .iter().filter_map(|r| {
-                r.as_array().map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            }).collect();
+            .iter()
+            .filter_map(|r| {
+                r.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+            })
+            .collect();
 
         let banner = self.banner_for(&conn).await;
         let result = self.db.insert_rows(table, &columns, &rows).await?;
@@ -559,13 +632,22 @@ impl McpServer {
             return Err("Write operation blocked. This connection is read-only.".into());
         }
 
-        let table = args.get("table").and_then(|s| s.as_str()).ok_or("Missing: table")?;
-        let set_obj = args.get("set").and_then(|o| o.as_object()).ok_or("Missing: set")?;
+        let table = args
+            .get("table")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing: table")?;
+        let set_obj = args
+            .get("set")
+            .and_then(|o| o.as_object())
+            .ok_or("Missing: set")?;
         let mut set_columns: HashMap<String, String> = HashMap::new();
         for (k, v) in set_obj {
             set_columns.insert(k.clone(), v.as_str().unwrap_or("NULL").to_string());
         }
-        let conditions = args.get("where").and_then(|s| s.as_str()).ok_or("Missing: where")?;
+        let conditions = args
+            .get("where")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing: where")?;
         let expected_max_rows = args
             .get("expected_max_rows")
             .and_then(|v| v.as_u64())
@@ -585,8 +667,14 @@ impl McpServer {
             return Err("Write operation blocked. This connection is read-only.".into());
         }
 
-        let table = args.get("table").and_then(|s| s.as_str()).ok_or("Missing: table")?;
-        let conditions = args.get("where").and_then(|s| s.as_str()).ok_or("Missing: where")?;
+        let table = args
+            .get("table")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing: table")?;
+        let conditions = args
+            .get("where")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing: where")?;
         let expected_max_rows = args
             .get("expected_max_rows")
             .and_then(|v| v.as_u64())
@@ -602,9 +690,16 @@ impl McpServer {
 
     // ─── Transaction tools (#3) ────────────────────────────────────
 
-    async fn tool_begin_transaction(&self, config: &Config, args: &Value) -> Result<String, String> {
+    async fn tool_begin_transaction(
+        &self,
+        config: &Config,
+        args: &Value,
+    ) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let readonly = args.get("readonly").and_then(|b| b.as_bool()).unwrap_or(false);
+        let readonly = args
+            .get("readonly")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
         if !readonly && conn.readonly {
             return Err("Cannot start a read-write transaction on a read-only connection.".into());
         }
@@ -631,8 +726,14 @@ impl McpServer {
 
     async fn tool_explain_query(&self, config: &Config, args: &Value) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let sql = args.get("sql").and_then(|s| s.as_str()).ok_or("Missing: sql")?;
-        let analyze = args.get("analyze").and_then(|b| b.as_bool()).unwrap_or(false);
+        let sql = args
+            .get("sql")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing: sql")?;
+        let analyze = args
+            .get("analyze")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
         let banner = self.banner_for(&conn).await;
         let result = self.db.explain_query(sql, analyze, conn.readonly).await?;
         Ok(format!("{}\n{}", banner, result))
@@ -657,7 +758,10 @@ impl McpServer {
 
     async fn tool_search_schema(&self, config: &Config, args: &Value) -> Result<String, String> {
         let conn = self.ensure_connected(config).await?;
-        let query = args.get("query").and_then(|s| s.as_str()).ok_or("Missing: query")?;
+        let query = args
+            .get("query")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing: query")?;
         let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(25) as usize;
         let banner = self.banner_for(&conn).await;
         let result = self.db.search_schema(query, limit).await?;

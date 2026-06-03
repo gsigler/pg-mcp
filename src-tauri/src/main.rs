@@ -14,7 +14,6 @@ use mcp_server::McpServer;
 use std::sync::Arc;
 use tauri::State;
 
-
 struct AppState {
     db: Arc<DatabaseManager>,
 }
@@ -46,10 +45,21 @@ async fn save_connection(connection: Connection) -> Result<SafeConfig, String> {
             return Err(format!("Failed to store password in keychain: {}", e));
         }
     }
-    if let Some(ref cs) = conn.connection_string {
-        if !cs.is_empty() {
+    match conn.connection_string.as_deref().map(str::trim) {
+        Some(cs) if !cs.is_empty() => {
             if let Err(e) = secrets::save_connection_string(&conn.name, cs) {
-                return Err(format!("Failed to store connection string in keychain: {}", e));
+                return Err(format!(
+                    "Failed to store connection string in keychain: {}",
+                    e
+                ));
+            }
+        }
+        _ => {
+            if let Err(e) = secrets::delete_connection_string(&conn.name) {
+                return Err(format!(
+                    "Failed to clear old connection string from keychain: {}",
+                    e
+                ));
             }
         }
     }
@@ -57,10 +67,7 @@ async fn save_connection(connection: Connection) -> Result<SafeConfig, String> {
     conn.password.clear();
     conn.connection_string = None;
 
-    let is_new = config
-        .connections
-        .iter()
-        .all(|c| c.name != conn.name);
+    let is_new = config.connections.iter().all(|c| c.name != conn.name);
 
     let name = conn.name.clone();
     if let Some(existing) = config.connections.iter_mut().find(|c| c.name == conn.name) {
@@ -77,7 +84,11 @@ async fn save_connection(connection: Connection) -> Result<SafeConfig, String> {
     config.save()?;
 
     audit::log(
-        if is_new { "connection_added" } else { "connection_updated" },
+        if is_new {
+            "connection_added"
+        } else {
+            "connection_updated"
+        },
         serde_json::json!({"connection": name}),
     );
 
@@ -99,10 +110,17 @@ async fn delete_connection(name: String) -> Result<SafeConfig, String> {
     // the connection is already gone from disk and the orphaned keychain
     // entry is harmless.
     if let Err(e) = secrets::delete_all(&name) {
-        log::warn!("[pg-mcp] failed to delete keychain entries for '{}': {}", name, e);
+        log::warn!(
+            "[pg-mcp] failed to delete keychain entries for '{}': {}",
+            name,
+            e
+        );
     }
 
-    audit::log("connection_deleted", serde_json::json!({"connection": name}));
+    audit::log(
+        "connection_deleted",
+        serde_json::json!({"connection": name}),
+    );
 
     Ok(SafeConfig::from(&config))
 }
@@ -214,9 +232,10 @@ fn atomic_write_json(path: &std::path::Path, value: &serde_json::Value) -> Resul
             .map_err(|e| format!("Failed to create config dir: {}", e))?;
     }
     let tmp = path.with_extension("pgmcp.tmp");
-    let json = serde_json::to_string_pretty(value)
-        .map_err(|e| format!("Failed to serialize: {}", e))?;
+    let json =
+        serde_json::to_string_pretty(value).map_err(|e| format!("Failed to serialize: {}", e))?;
     std::fs::write(&tmp, json).map_err(|e| format!("Failed to write temp file: {}", e))?;
+    set_private_permissions(&tmp)?;
     std::fs::rename(&tmp, path).map_err(|e| format!("Failed to commit config: {}", e))?;
     Ok(())
 }
@@ -230,20 +249,69 @@ fn atomic_write_toml(path: &std::path::Path, value: &toml::Value) -> Result<(), 
             .map_err(|e| format!("Failed to create config dir: {}", e))?;
     }
     let tmp = path.with_extension("pgmcp.tmp");
-    let body = toml::to_string_pretty(value)
-        .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
+    let body =
+        toml::to_string_pretty(value).map_err(|e| format!("Failed to serialize TOML: {}", e))?;
     std::fs::write(&tmp, body).map_err(|e| format!("Failed to write temp file: {}", e))?;
+    set_private_permissions(&tmp)?;
     std::fs::rename(&tmp, path).map_err(|e| format!("Failed to commit config: {}", e))?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Failed to set config permissions: {}", e))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn read_json_config(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read config: {}", e))?;
+    serde_json::from_str(&contents).map_err(|e| {
+        format!(
+            "Refusing to update invalid JSON config at {}: {}",
+            path.display(),
+            e
+        )
+    })
+}
+
+fn read_toml_config(path: &std::path::Path) -> Result<toml::Value, String> {
+    if !path.exists() {
+        return Ok(toml::Value::Table(toml::value::Table::new()));
+    }
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read config: {}", e))?;
+    contents.parse::<toml::Value>().map_err(|e| {
+        format!(
+            "Refusing to update invalid TOML config at {}: {}",
+            path.display(),
+            e
+        )
+    })
 }
 
 /// Decide what key to use for our entry, avoiding clobbering an unrelated
 /// "postgres" MCP the user may already have configured.
 fn pg_mcp_key(existing: Option<&serde_json::Value>, binary: &str) -> String {
     match existing {
-        Some(obj) if obj.get("postgres").and_then(|e| e.get("command"))
-            .and_then(|c| c.as_str())
-            .map_or(true, |cmd| cmd == binary) => "postgres".into(),
+        Some(obj)
+            if obj
+                .get("postgres")
+                .and_then(|e| e.get("command"))
+                .and_then(|c| c.as_str())
+                .map_or(true, |cmd| cmd == binary) =>
+        {
+            "postgres".into()
+        }
         Some(_) => "pg-mcp".into(),
         None => "postgres".into(),
     }
@@ -266,13 +334,7 @@ async fn add_to_claude_desktop() -> Result<String, String> {
         .ok_or("Cannot find home directory")?
         .join("Library/Application Support/Claude/claude_desktop_config.json");
 
-    let mut config: serde_json::Value = if config_path.exists() {
-        let contents = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read config: {}", e))?;
-        serde_json::from_str(&contents).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
+    let mut config = read_json_config(&config_path)?;
 
     if config.get("mcpServers").is_none() {
         config["mcpServers"] = serde_json::json!({});
@@ -301,13 +363,7 @@ async fn add_to_claude_code() -> Result<String, String> {
         .ok_or("Cannot find home directory")?
         .join(".claude.json");
 
-    let mut config: serde_json::Value = if config_path.exists() {
-        let contents = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read config: {}", e))?;
-        serde_json::from_str(&contents).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
+    let mut config = read_json_config(&config_path)?;
 
     // Register at USER scope (top-level `mcpServers`) so the server is
     // available regardless of which directory the user runs `claude`
@@ -335,9 +391,7 @@ async fn add_to_claude_code() -> Result<String, String> {
             .and_then(|h| h.get_mut("mcpServers"))
             .and_then(|m| m.as_object_mut())
         {
-            mcps.retain(|_k, v| {
-                v.get("command").and_then(|c| c.as_str()) != Some(&binary)
-            });
+            mcps.retain(|_k, v| v.get("command").and_then(|c| c.as_str()) != Some(&binary));
         }
     }
 
@@ -362,13 +416,7 @@ async fn add_to_cursor() -> Result<String, String> {
         .join(".cursor")
         .join("mcp.json");
 
-    let mut config: serde_json::Value = if config_path.exists() {
-        let contents = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read config: {}", e))?;
-        serde_json::from_str(&contents).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
+    let mut config = read_json_config(&config_path)?;
 
     if config.get("mcpServers").is_none() {
         config["mcpServers"] = serde_json::json!({});
@@ -400,13 +448,7 @@ async fn add_to_vscode() -> Result<String, String> {
         .ok_or("Cannot find home directory")?
         .join("Library/Application Support/Code/User/mcp.json");
 
-    let mut config: serde_json::Value = if config_path.exists() {
-        let contents = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read config: {}", e))?;
-        serde_json::from_str(&contents).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
+    let mut config = read_json_config(&config_path)?;
 
     if config.get("servers").is_none() {
         config["servers"] = serde_json::json!({});
@@ -441,15 +483,7 @@ async fn add_to_codex() -> Result<String, String> {
         .join(".codex")
         .join("config.toml");
 
-    let mut root: toml::Value = if config_path.exists() {
-        let contents = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read config: {}", e))?;
-        contents
-            .parse::<toml::Value>()
-            .unwrap_or_else(|_| toml::Value::Table(toml::value::Table::new()))
-    } else {
-        toml::Value::Table(toml::value::Table::new())
-    };
+    let mut root = read_toml_config(&config_path)?;
 
     // Ensure `[mcp_servers]` exists and is a table.
     let root_table = root
@@ -479,10 +513,7 @@ async fn add_to_codex() -> Result<String, String> {
     };
 
     let mut entry = toml::value::Table::new();
-    entry.insert(
-        "command".into(),
-        toml::Value::String(binary.clone()),
-    );
+    entry.insert("command".into(), toml::Value::String(binary.clone()));
     entry.insert(
         "args".into(),
         toml::Value::Array(vec![toml::Value::String("serve".into())]),
@@ -523,8 +554,10 @@ async fn check_agent_status() -> Result<serde_json::Value, String> {
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok());
-    let desktop_installed =
-        has_our_binary(desktop_cfg.as_ref().and_then(|v| v.get("mcpServers")), &binary);
+    let desktop_installed = has_our_binary(
+        desktop_cfg.as_ref().and_then(|v| v.get("mcpServers")),
+        &binary,
+    );
 
     // Claude Code: we install at user scope (top-level `mcpServers`),
     // but earlier builds wrote to project scope under the home directory.
@@ -537,10 +570,8 @@ async fn check_agent_status() -> Result<serde_json::Value, String> {
     let home = dirs::home_dir()
         .map(|h| h.display().to_string())
         .unwrap_or_default();
-    let code_user_scope = has_our_binary(
-        code_cfg.as_ref().and_then(|v| v.get("mcpServers")),
-        &binary,
-    );
+    let code_user_scope =
+        has_our_binary(code_cfg.as_ref().and_then(|v| v.get("mcpServers")), &binary);
     let code_project_scope = has_our_binary(
         code_cfg
             .as_ref()
@@ -579,16 +610,14 @@ async fn check_agent_status() -> Result<serde_json::Value, String> {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| s.parse::<toml::Value>().ok())
         .and_then(|v| {
-            v.get("mcp_servers")
-                .and_then(|m| m.as_table())
-                .map(|t| {
-                    t.values().any(|entry| {
-                        entry
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .map_or(false, |cmd| cmd == binary)
-                    })
+            v.get("mcp_servers").and_then(|m| m.as_table()).map(|t| {
+                t.values().any(|entry| {
+                    entry
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map_or(false, |cmd| cmd == binary)
                 })
+            })
         })
         .unwrap_or(false);
 

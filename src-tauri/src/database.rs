@@ -11,6 +11,8 @@ use tokio_postgres::{Client, Config as PgConfig, Error as PgError, NoTls, Row};
 
 const MAX_RESULT_ROWS: usize = 100;
 const MAX_COLUMN_WIDTH: usize = 60;
+const MAX_INSERT_ROWS: usize = 100;
+pub const MAX_EXPECTED_WRITE_ROWS: u64 = 100;
 const STATEMENT_TIMEOUT: &str = "30s";
 const IDLE_IN_TXN_TIMEOUT: &str = "60s";
 
@@ -19,8 +21,8 @@ const IDLE_IN_TXN_TIMEOUT: &str = "60s";
 /// is injected into the libpq startup `options` so Postgres applies it
 /// before any SQL runs and resists client-side SET overrides.
 const WRITE_KEYWORDS: &[&str] = &[
-    "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE",
-    "GRANT", "REVOKE", "COPY", "VACUUM", "REINDEX", "COMMENT", "SECURITY",
+    "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "GRANT", "REVOKE", "COPY",
+    "VACUUM", "REINDEX", "COMMENT", "SECURITY",
 ];
 
 const WRITE_COMPOUND_KEYWORDS: &[&str] = &["SET ROLE", "RESET ROLE"];
@@ -64,6 +66,10 @@ pub struct DatabaseManager {
     /// reset on RO connections doesn't rebuild it each call. `None` on
     /// read-write connections (no reset needed).
     reset_sql: Arc<Mutex<Option<String>>>,
+    /// Snapshot of non-secret connection settings. If the UI changes the
+    /// active connection in place, the MCP child must reconnect so safety
+    /// flags like readonly and PII redaction take effect immediately.
+    active_settings_signature: Arc<Mutex<Option<String>>>,
 }
 
 impl DatabaseManager {
@@ -77,6 +83,7 @@ impl DatabaseManager {
             readonly: Arc::new(Mutex::new(false)),
             observed_readonly: Arc::new(Mutex::new(false)),
             reset_sql: Arc::new(Mutex::new(None)),
+            active_settings_signature: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -86,6 +93,10 @@ impl DatabaseManager {
 
     pub async fn observed_readonly(&self) -> bool {
         *self.observed_readonly.lock().await
+    }
+
+    pub async fn active_settings_signature(&self) -> Option<String> {
+        self.active_settings_signature.lock().await.clone()
     }
 
     pub async fn is_connected(&self) -> bool {
@@ -139,6 +150,7 @@ impl DatabaseManager {
         *self.readonly.lock().await = conn.readonly;
         *self.observed_readonly.lock().await = observed;
         *self.reset_sql.lock().await = reset_sql;
+        *self.active_settings_signature.lock().await = Some(conn.settings_signature());
         crate::audit::log(
             "db_connected",
             serde_json::json!({
@@ -162,6 +174,7 @@ impl DatabaseManager {
         *self.readonly.lock().await = false;
         *self.observed_readonly.lock().await = false;
         *self.reset_sql.lock().await = None;
+        *self.active_settings_signature.lock().await = None;
     }
 
     /// On read-only connections outside a user transaction, run DISCARD
@@ -198,7 +211,9 @@ impl DatabaseManager {
     async fn get_client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Client>>, String> {
         let guard = self.client.lock().await;
         if guard.is_none() {
-            return Err("No active connection. Open the pg-mcp UI and activate a connection.".into());
+            return Err(
+                "No active connection. Open the pg-mcp UI and activate a connection.".into(),
+            );
         }
         Ok(guard)
     }
@@ -210,9 +225,12 @@ impl DatabaseManager {
                 return true;
             }
         }
-        if normalized.starts_with("BEGIN") || normalized.starts_with("COMMIT")
-            || normalized.starts_with("ROLLBACK") || normalized.starts_with("SAVEPOINT")
-            || normalized.starts_with("RELEASE") {
+        if normalized.starts_with("BEGIN")
+            || normalized.starts_with("COMMIT")
+            || normalized.starts_with("ROLLBACK")
+            || normalized.starts_with("SAVEPOINT")
+            || normalized.starts_with("RELEASE")
+        {
             return false;
         }
         if let Some(first_token) = normalized.split_whitespace().next() {
@@ -236,13 +254,40 @@ impl DatabaseManager {
         }
     }
 
+    pub fn check_readonly_escape(sql: &str) -> bool {
+        let normalized = strip_leading_sql_comments(sql).to_uppercase();
+        let compact: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
+
+        if normalized.starts_with("BEGIN") || normalized.starts_with("START TRANSACTION") {
+            if normalized.contains("READ WRITE") {
+                return true;
+            }
+        }
+
+        compact.contains("SET_CONFIG(") || compact.contains(".SET_CONFIG(")
+    }
+
+    pub fn ensure_single_statement(sql: &str) -> Result<(), String> {
+        if sql.trim().is_empty() {
+            return Err("SQL query is empty.".into());
+        }
+        if let Some(idx) = first_unquoted_semicolon(sql) {
+            if has_sql_after_statement_terminator(&sql[idx + 1..]) {
+                return Err(
+                    "Multiple SQL statements are not allowed in a single MCP tool call. \
+                     Run one statement at a time so readonly and audit guardrails apply \
+                     to the exact statement being executed."
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     // ─── Core query execution ──────────────────────────────────────
 
-    pub async fn execute_query(
-        &self,
-        sql: &str,
-        readonly: bool,
-    ) -> Result<String, String> {
+    pub async fn execute_query(&self, sql: &str, readonly: bool) -> Result<String, String> {
+        Self::ensure_single_statement(sql)?;
         // Fast-fail UX checks. Real enforcement is the startup-options
         // `default_transaction_read_only=on` and the post-query session
         // reset; these errors just produce clearer messages than letting
@@ -260,6 +305,13 @@ impl DatabaseManager {
                  connections. These can weaken the guardrail they exist to enforce. \
                  If you need to change a session parameter, switch to a read-write \
                  connection in the pg-mcp UI."
+                    .into(),
+            );
+        }
+        if readonly && Self::check_readonly_escape(sql) {
+            return Err(
+                "Read-only guardrail escape blocked. READ WRITE transactions and \
+                 set_config(...) calls are not allowed on read-only connections."
                     .into(),
             );
         }
@@ -287,12 +339,14 @@ impl DatabaseManager {
         let response = match result {
             Ok(rows) => {
                 let row_count = rows.len();
-                self.record_query(sql, duration_ms, Some(row_count), None).await;
+                self.record_query(sql, duration_ms, Some(row_count), None)
+                    .await;
                 Ok(format_rows_opt(&rows, redact))
             }
             Err(e) => {
                 let err = format!("Query error: {}", e);
-                self.record_query(sql, duration_ms, None, Some(err.clone())).await;
+                self.record_query(sql, duration_ms, None, Some(err.clone()))
+                    .await;
                 self.clear_stale_client_after_error(&e).await;
                 Err(err)
             }
@@ -317,72 +371,84 @@ impl DatabaseManager {
         params: &[&(dyn ToSql + Sync)],
         expected_max_rows: u64,
     ) -> Result<String, String> {
+        Self::ensure_single_statement(sql)?;
+        Self::validate_expected_max_rows(expected_max_rows)?;
         let start = Instant::now();
         let redact = *self.redact_pii.lock().await;
-        let guard = self.get_client().await?;
-        let client = guard.as_ref().unwrap();
-        let in_user_txn = *self.in_transaction.lock().await;
-        let savepoint = "pgmcp_write_cap";
+        let mut stale_error: Option<PgError> = None;
 
-        // Open scope
-        let open_res = if in_user_txn {
-            client
-                .batch_execute(&format!("SAVEPOINT {}", savepoint))
-                .await
-        } else {
-            client.batch_execute("BEGIN").await
-        };
-        open_res.map_err(|e| format!("Failed to open write guard: {}", e))?;
+        let response = {
+            let guard = self.get_client().await?;
+            let client = guard.as_ref().unwrap();
+            let in_user_txn = *self.in_transaction.lock().await;
+            let savepoint = format!("pgmcp_write_cap_{}", uuid::Uuid::new_v4().simple());
 
-        let result = client.query(sql, params).await;
-        let duration_ms = start.elapsed().as_millis();
+            // Open scope
+            let open_res = if in_user_txn {
+                client
+                    .batch_execute(&format!("SAVEPOINT {}", savepoint))
+                    .await
+            } else {
+                client.batch_execute("BEGIN").await
+            };
+            open_res.map_err(|e| format!("Failed to open write guard: {}", e))?;
 
-        let undo_sql = if in_user_txn {
-            format!(
-                "ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp}",
-                sp = savepoint
-            )
-        } else {
-            "ROLLBACK".to_string()
-        };
-        let commit_sql = if in_user_txn {
-            format!("RELEASE SAVEPOINT {}", savepoint)
-        } else {
-            "COMMIT".to_string()
-        };
+            let result = client.query(sql, params).await;
+            let duration_ms = start.elapsed().as_millis();
 
-        match result {
-            Ok(rows) => {
-                let row_count = rows.len() as u64;
-                if row_count > expected_max_rows {
+            let undo_sql = if in_user_txn {
+                format!(
+                    "ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp}",
+                    sp = savepoint
+                )
+            } else {
+                "ROLLBACK".to_string()
+            };
+            let commit_sql = if in_user_txn {
+                format!("RELEASE SAVEPOINT {}", savepoint)
+            } else {
+                "COMMIT".to_string()
+            };
+
+            match result {
+                Ok(rows) => {
+                    let row_count = rows.len() as u64;
+                    if row_count > expected_max_rows {
+                        let _ = client.batch_execute(&undo_sql).await;
+                        let err = format!(
+                            "Blocked: statement would affect {} rows, but expected_max_rows = {}. \
+                             No changes were committed. Tighten the WHERE clause and retry.",
+                            row_count, expected_max_rows
+                        );
+                        self.record_query(sql, duration_ms, None, Some(err.clone()))
+                            .await;
+                        Err(err)
+                    } else {
+                        client
+                            .batch_execute(&commit_sql)
+                            .await
+                            .map_err(|e| format!("Failed to commit write: {}", e))?;
+                        self.record_query(sql, duration_ms, Some(row_count as usize), None)
+                            .await;
+                        Ok(format_rows_opt(&rows, redact))
+                    }
+                }
+                Err(e) => {
                     let _ = client.batch_execute(&undo_sql).await;
-                    let err = format!(
-                        "Blocked: statement would affect {} rows, but expected_max_rows = {}. \
-                         No changes were committed. Re-issue the call with \
-                         expected_max_rows >= {} (or tighten the WHERE clause) to proceed.",
-                        row_count, expected_max_rows, row_count
-                    );
-                    self.record_query(sql, duration_ms, None, Some(err.clone())).await;
-                    Err(err)
-                } else {
-                    client
-                        .batch_execute(&commit_sql)
-                        .await
-                        .map_err(|e| format!("Failed to commit write: {}", e))?;
-                    self.record_query(sql, duration_ms, Some(row_count as usize), None)
+                    let err = format!("Query error: {}", e);
+                    self.record_query(sql, duration_ms, None, Some(err.clone()))
                         .await;
-                    Ok(format_rows_opt(&rows, redact))
+                    stale_error = Some(e);
+                    Err(err)
                 }
             }
-            Err(e) => {
-                let _ = client.batch_execute(&undo_sql).await;
-                let err = format!("Query error: {}", e);
-                self.record_query(sql, duration_ms, None, Some(err.clone())).await;
-                drop(guard);
-                self.clear_stale_client_after_error(&e).await;
-                Err(err)
-            }
+        };
+
+        if let Some(e) = stale_error {
+            self.clear_stale_client_after_error(&e).await;
         }
+        self.reset_if_readonly_outside_txn().await;
+        response
     }
 
     /// Execute query with pagination support
@@ -393,17 +459,20 @@ impl DatabaseManager {
         limit: usize,
         offset: usize,
     ) -> Result<String, String> {
+        Self::ensure_single_statement(sql)?;
         // Clamp to sensible bounds; values are integers so safe to inline.
         let limit = limit.min(10_000);
         let offset = offset.min(10_000_000);
+        let sql = trim_trailing_statement_semicolon(sql);
         let paginated = format!(
             "SELECT * FROM ({}) AS __pgmcp_paged LIMIT {} OFFSET {}",
-            sql.trim().trim_end_matches(';'),
-            limit,
-            offset
+            sql, limit, offset
         );
         let result = self.execute_query(&paginated, readonly).await?;
-        Ok(format!("{}\n(page: offset={}, limit={})\n", result, offset, limit))
+        Ok(format!(
+            "{}\n(page: offset={}, limit={})\n",
+            result, offset, limit
+        ))
     }
 
     // ─── Transaction support ───────────────────────────────────────
@@ -421,7 +490,9 @@ impl DatabaseManager {
         } else {
             "BEGIN TRANSACTION"
         };
-        client.execute(sql, &[]).await
+        client
+            .execute(sql, &[])
+            .await
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
         *self.in_transaction.lock().await = true;
@@ -436,7 +507,9 @@ impl DatabaseManager {
         {
             let guard = self.get_client().await?;
             let client = guard.as_ref().unwrap();
-            client.execute("COMMIT", &[]).await
+            client
+                .execute("COMMIT", &[])
+                .await
                 .map_err(|e| format!("Failed to commit: {}", e))?;
         }
 
@@ -455,7 +528,9 @@ impl DatabaseManager {
         {
             let guard = self.get_client().await?;
             let client = guard.as_ref().unwrap();
-            client.execute("ROLLBACK", &[]).await
+            client
+                .execute("ROLLBACK", &[])
+                .await
                 .map_err(|e| format!("Failed to rollback: {}", e))?;
         }
 
@@ -474,6 +549,13 @@ impl DatabaseManager {
     ) -> Result<String, String> {
         if rows.is_empty() {
             return Err("No rows provided.".into());
+        }
+        if rows.len() > MAX_INSERT_ROWS {
+            return Err(format!(
+                "Too many rows for one insert_rows call ({} > {}). Chunk the insert.",
+                rows.len(),
+                MAX_INSERT_ROWS
+            ));
         }
         if columns.is_empty() {
             return Err("No columns provided.".into());
@@ -529,8 +611,15 @@ impl DatabaseManager {
             return Err("No columns to update.".into());
         }
         if conditions.trim().is_empty() {
-            return Err("WHERE condition is required for safety. Use 'TRUE' to update all rows.".into());
+            return Err("WHERE condition is required for safety.".into());
         }
+        if is_unconditional_where(conditions) {
+            return Err(
+                "Unconditional WHERE clauses such as TRUE or 1=1 are blocked for production safety."
+                    .into(),
+            );
+        }
+        Self::validate_expected_max_rows(expected_max_rows)?;
 
         let (schema_q, tbl_q) = parse_qualified(table);
 
@@ -557,7 +646,8 @@ impl DatabaseManager {
             set_parts.join(", "),
             conditions
         );
-        self.execute_write_capped(&sql, &[], expected_max_rows).await
+        self.execute_write_capped(&sql, &[], expected_max_rows)
+            .await
     }
 
     pub async fn delete_rows(
@@ -567,15 +657,23 @@ impl DatabaseManager {
         expected_max_rows: u64,
     ) -> Result<String, String> {
         if conditions.trim().is_empty() {
-            return Err("WHERE condition is required for safety. Use 'TRUE' to delete all rows.".into());
+            return Err("WHERE condition is required for safety.".into());
         }
+        if is_unconditional_where(conditions) {
+            return Err(
+                "Unconditional WHERE clauses such as TRUE or 1=1 are blocked for production safety."
+                    .into(),
+            );
+        }
+        Self::validate_expected_max_rows(expected_max_rows)?;
 
         let (schema_q, tbl_q) = parse_qualified(table);
         let sql = format!(
             "DELETE FROM {}.{} WHERE {} RETURNING *",
             schema_q, tbl_q, conditions
         );
-        self.execute_write_capped(&sql, &[], expected_max_rows).await
+        self.execute_write_capped(&sql, &[], expected_max_rows)
+            .await
     }
 
     // ─── Explain / dry-run ─────────────────────────────────────────
@@ -586,20 +684,34 @@ impl DatabaseManager {
         analyze: bool,
         readonly: bool,
     ) -> Result<String, String> {
-        // If the connection is read-only, refuse EXPLAIN ANALYZE of a
-        // suspected write. Plain EXPLAIN is harmless. Server-side
-        // default_transaction_read_only will also block writes here, but
-        // the early refusal is clearer.
-        if analyze && readonly && Self::check_write_query(sql) {
+        Self::ensure_single_statement(sql)?;
+        // EXPLAIN ANALYZE executes the supplied SQL, including volatile
+        // functions. On read-only production connections, keep EXPLAIN as a
+        // planning-only operation.
+        if analyze && readonly {
             return Err(
-                "EXPLAIN ANALYZE would execute this write statement. \
-                 Blocked by read-only mode."
+                "EXPLAIN ANALYZE executes the query and is blocked on read-only connections. \
+                 Run plain EXPLAIN instead."
                     .into(),
             );
         }
-        let prefix = if analyze { "EXPLAIN ANALYZE" } else { "EXPLAIN" };
-        let explain_sql = format!("{} {}", prefix, sql);
+        let prefix = if analyze {
+            "EXPLAIN ANALYZE"
+        } else {
+            "EXPLAIN"
+        };
+        let explain_sql = format!("{} {}", prefix, trim_trailing_statement_semicolon(sql));
         self.execute_parameterized(&explain_sql, &[]).await
+    }
+
+    fn validate_expected_max_rows(expected_max_rows: u64) -> Result<(), String> {
+        if expected_max_rows > MAX_EXPECTED_WRITE_ROWS {
+            return Err(format!(
+                "expected_max_rows={} exceeds the production safety cap of {} rows.",
+                expected_max_rows, MAX_EXPECTED_WRITE_ROWS
+            ));
+        }
+        Ok(())
     }
 
     // ─── Enhanced describe_table ───────────────────────────────────
@@ -614,11 +726,13 @@ impl DatabaseManager {
         let client = guard.as_ref().unwrap();
 
         // --- Row count ---
-        let count_sql =
-            "SELECT n_live_tup::bigint AS approx_rows \
+        let count_sql = "SELECT n_live_tup::bigint AS approx_rows \
              FROM pg_stat_user_tables \
              WHERE schemaname = $1 AND relname = $2";
-        let count_rows = client.query(count_sql, &[&schema, &tbl]).await.unwrap_or_default();
+        let count_rows = client
+            .query(count_sql, &[&schema, &tbl])
+            .await
+            .unwrap_or_default();
         let approx_rows: i64 = count_rows
             .first()
             .and_then(|r| r.try_get(0).ok())
@@ -627,8 +741,7 @@ impl DatabaseManager {
         let mut output = format!("{}.{} (~{} rows)\n\n", schema, tbl, approx_rows);
 
         // --- Columns ---
-        let col_sql =
-            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
+        let col_sql = "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
                     pgd.description AS column_comment \
              FROM information_schema.columns c \
              LEFT JOIN pg_catalog.pg_statio_all_tables st \
@@ -687,8 +800,7 @@ impl DatabaseManager {
         }
 
         // --- Indexes ---
-        let idx_sql =
-            "SELECT indexname, indexdef FROM pg_indexes \
+        let idx_sql = "SELECT indexname, indexdef FROM pg_indexes \
              WHERE schemaname = $1 AND tablename = $2";
         let idx_rows = client
             .query(idx_sql, &[&schema, &tbl])
@@ -700,8 +812,7 @@ impl DatabaseManager {
         }
 
         // --- Outgoing foreign keys ---
-        let fk_sql =
-            "SELECT tc.constraint_name, kcu.column_name, \
+        let fk_sql = "SELECT tc.constraint_name, kcu.column_name, \
                     ccu.table_schema || '.' || ccu.table_name AS foreign_table, \
                     ccu.column_name AS foreign_column \
              FROM information_schema.table_constraints tc \
@@ -723,8 +834,7 @@ impl DatabaseManager {
         }
 
         // --- Incoming foreign keys ---
-        let rfk_sql =
-            "SELECT tc.table_schema || '.' || tc.table_name AS referencing_table, \
+        let rfk_sql = "SELECT tc.table_schema || '.' || tc.table_name AS referencing_table, \
                     kcu.column_name AS referencing_column, \
                     tc.constraint_name \
              FROM information_schema.table_constraints tc \
@@ -932,8 +1042,10 @@ impl DatabaseManager {
         // Both occurrences of `schemaname {pred}` share the same param list
         // when `= $1` is used. Postgres expects one $1 binding regardless
         // of how many times it appears.
-        let params: Vec<&(dyn ToSql + Sync)> =
-            params_owned.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let params: Vec<&(dyn ToSql + Sync)> = params_owned
+            .iter()
+            .map(|p| p as &(dyn ToSql + Sync))
+            .collect();
         let rows = client
             .query(&sql, &params)
             .await
@@ -991,8 +1103,7 @@ impl DatabaseManager {
         let guard = self.get_client().await?;
         let client = guard.as_ref().unwrap();
 
-        let col_sql =
-            "SELECT c.table_name, c.column_name, c.data_type, \
+        let col_sql = "SELECT c.table_name, c.column_name, c.data_type, \
                     CASE WHEN pk.column_name IS NOT NULL THEN 'PK' ELSE '' END AS is_pk \
              FROM information_schema.columns c \
              LEFT JOIN ( \
@@ -1009,8 +1120,7 @@ impl DatabaseManager {
             .await
             .map_err(|e| format!("Query error: {}", e))?;
 
-        let fk_sql =
-            "SELECT tc.table_name, kcu.column_name, \
+        let fk_sql = "SELECT tc.table_name, kcu.column_name, \
                     ccu.table_name AS foreign_table, ccu.column_name AS foreign_column \
              FROM information_schema.table_constraints tc \
              JOIN information_schema.key_column_usage kcu \
@@ -1085,7 +1195,10 @@ impl DatabaseManager {
         let db_name: String = hdr.get(0);
         let version: String = hdr.get(1);
         let short_ver = version.split(" on ").next().unwrap_or(&version);
-        output.push_str(&format!("DATABASE: {}\n  Version: {}\n", db_name, short_ver));
+        output.push_str(&format!(
+            "DATABASE: {}\n  Version: {}\n",
+            db_name, short_ver
+        ));
 
         let schemas = client
             .query(
@@ -1334,8 +1447,12 @@ impl DatabaseManager {
             ));
         }
 
-        let mut output = format!("Matches for '{}' ({} result{}):\n", query, rows.len(),
-            if rows.len() == 1 { "" } else { "s" });
+        let mut output = format!(
+            "Matches for '{}' ({} result{}):\n",
+            query,
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" }
+        );
         for row in &rows {
             let kind: String = row.get(0);
             let schema: String = row.get(1);
@@ -1380,13 +1497,14 @@ impl DatabaseManager {
         // Persist to the shared audit log first so a crash between this
         // call and in-memory insertion still leaves a trail.
         crate::audit::log(
-            if error.is_some() { "query_error" } else { "query" },
+            if error.is_some() {
+                "query_error"
+            } else {
+                "query"
+            },
             serde_json::json!({
                 "connection": conn_name,
-                // Truncate very long SQL so the log file doesn't balloon
-                // on a pathological insert. Full text still lives in the
-                // in-memory ring for `query_history`.
-                "sql": truncate_for_log(sql, 4000),
+                "sql": truncate_for_log(&redact_sql_literals(sql), 4000),
                 "duration_ms": duration_ms as u64,
                 "rows": row_count,
                 "error": error,
@@ -1394,7 +1512,7 @@ impl DatabaseManager {
         );
 
         let record = QueryRecord {
-            sql: sql.to_string(),
+            sql: redact_sql_literals(sql),
             timestamp: chrono::Utc::now().naive_utc(),
             duration_ms,
             row_count,
@@ -1417,7 +1535,10 @@ impl DatabaseManager {
             .map(|client| client.is_closed())
             .unwrap_or(false);
         if client_closed || is_connection_closed_message(&err.to_string()) {
-            log::info!("[pg-mcp] clearing stale database connection after error: {}", err);
+            log::info!(
+                "[pg-mcp] clearing stale database connection after error: {}",
+                err
+            );
             self.disconnect().await;
         }
     }
@@ -1428,14 +1549,22 @@ impl DatabaseManager {
             return "No queries in session history.\n".into();
         }
 
-        let start = if history.len() > limit { history.len() - limit } else { 0 };
+        let start = if history.len() > limit {
+            history.len() - limit
+        } else {
+            0
+        };
         let mut output = format!("Last {} queries:\n\n", history.len().min(limit));
 
         for (i, record) in history[start..].iter().enumerate() {
             let status = if let Some(ref err) = record.error {
                 format!("ERROR: {}", err)
             } else {
-                format!("{} rows, {}ms", record.row_count.unwrap_or(0), record.duration_ms)
+                format!(
+                    "{} rows, {}ms",
+                    record.row_count.unwrap_or(0),
+                    record.duration_ms
+                )
             };
             output.push_str(&format!(
                 "{}. [{}] {}\n   {}\n\n",
@@ -1467,10 +1596,12 @@ async fn connect_client(conn: &Connection) -> Result<Client, String> {
             .build()
             .map_err(|e| format!("TLS setup failed: {}", e))?;
         let tls = MakeTlsConnector::new(tls);
-        let (c, h) = cfg
-            .connect(tls)
-            .await
-            .map_err(|e| format!("Connection failed (TLS): {}", hint_ssl_error(&e.to_string(), conn)))?;
+        let (c, h) = cfg.connect(tls).await.map_err(|e| {
+            format!(
+                "Connection failed (TLS): {}",
+                hint_ssl_error(&e.to_string(), conn)
+            )
+        })?;
         tokio::spawn(async move {
             if let Err(e) = h.await {
                 log::error!("Connection error: {}", e);
@@ -1478,10 +1609,12 @@ async fn connect_client(conn: &Connection) -> Result<Client, String> {
         });
         c
     } else {
-        let (c, h) = cfg
-            .connect(NoTls)
-            .await
-            .map_err(|e| format!("Connection failed: {}", hint_ssl_error(&e.to_string(), conn)))?;
+        let (c, h) = cfg.connect(NoTls).await.map_err(|e| {
+            format!(
+                "Connection failed: {}",
+                hint_ssl_error(&e.to_string(), conn)
+            )
+        })?;
         tokio::spawn(async move {
             if let Err(e) = h.await {
                 log::error!("Connection error: {}", e);
@@ -1709,11 +1842,7 @@ fn strip_unsupported_url_query_params(cs: &str) -> (String, Vec<String>) {
 /// `options` param (see `build_connect_config`) rather than here, so it
 /// applies before any SQL runs.
 async fn apply_hardening(client: &Client, conn: &Connection) -> Result<String, String> {
-    let app_name_raw = format!(
-        "pg-mcp/{}/{}",
-        crate::audit::session_id(),
-        conn.name
-    );
+    let app_name_raw = format!("pg-mcp/{}/{}", crate::audit::session_id(), conn.name);
     let app_name_escaped = app_name_raw.replace('\'', "''");
 
     // For RO connections we also re-assert `default_transaction_read_only`
@@ -1876,7 +2005,10 @@ fn format_rows_opt(rows: &[Row], redact: bool) -> String {
 
     let total = rows.len();
     if total > MAX_RESULT_ROWS {
-        output.push_str(&format!("\n(showing {} of {} rows)\n", MAX_RESULT_ROWS, total));
+        output.push_str(&format!(
+            "\n(showing {} of {} rows)\n",
+            MAX_RESULT_ROWS, total
+        ));
     } else {
         output.push_str(&format!("({} rows)\n", total));
     }
@@ -1940,7 +2072,10 @@ fn get_cell_string(row: &Row, idx: usize, ty: &tokio_postgres::types::Type) -> S
         Type::INT4_ARRAY => match row.try_get::<_, Option<Vec<i32>>>(idx) {
             Ok(Some(v)) => format!(
                 "{{{}}}",
-                v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+                v.iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
             Ok(None) => "NULL".into(),
             Err(_) => "NULL".into(),
@@ -1966,6 +2101,194 @@ fn truncate_for_log(s: &str, max: usize) -> String {
             .unwrap_or(0);
         format!("{}…", &s[..end])
     }
+}
+
+fn trim_trailing_statement_semicolon(sql: &str) -> &str {
+    if let Some(idx) = first_unquoted_semicolon(sql) {
+        if !has_sql_after_statement_terminator(&sql[idx + 1..]) {
+            return sql[..idx].trim();
+        }
+    }
+    sql.trim()
+}
+
+fn strip_leading_sql_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(rest) = sql.strip_prefix("--") {
+            if let Some(pos) = rest.find('\n') {
+                sql = &rest[pos + 1..];
+                continue;
+            }
+            return "";
+        }
+        if let Some(rest) = sql.strip_prefix("/*") {
+            if let Some(pos) = rest.find("*/") {
+                sql = &rest[pos + 2..];
+                continue;
+            }
+            return "";
+        }
+        return sql;
+    }
+}
+
+fn has_sql_after_statement_terminator(sql: &str) -> bool {
+    !strip_leading_sql_comments(sql).trim().is_empty()
+}
+
+fn first_unquoted_semicolon(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                let mut depth = 1;
+                while i + 1 < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => {
+                if let Some(delim) = dollar_quote_delimiter_at(sql, i) {
+                    let search_start = i + delim.len();
+                    if let Some(pos) = sql[search_start..].find(&delim) {
+                        i = search_start + pos + delim.len();
+                    } else {
+                        i = bytes.len();
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            b';' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn dollar_quote_delimiter_at(sql: &str, start: usize) -> Option<String> {
+    let bytes = sql.as_bytes();
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        end += 1;
+    }
+    if end < bytes.len() && bytes[end] == b'$' {
+        Some(sql[start..=end].to_string())
+    } else {
+        None
+    }
+}
+
+fn is_unconditional_where(conditions: &str) -> bool {
+    let mut compact: String = strip_leading_sql_comments(conditions)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_uppercase();
+    loop {
+        if compact.starts_with('(') && compact.ends_with(')') {
+            compact = compact[1..compact.len() - 1].to_string();
+        } else {
+            break;
+        }
+    }
+    matches!(compact.as_str(), "TRUE" | "1=1")
+}
+
+fn redact_sql_literals(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                out.push_str("'[REDACTED]'");
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => {
+                if let Some(delim) = dollar_quote_delimiter_at(sql, i) {
+                    out.push_str("$pgmcp$[REDACTED]$pgmcp$");
+                    let search_start = i + delim.len();
+                    if let Some(pos) = sql[search_start..].find(&delim) {
+                        i = search_start + pos + delim.len();
+                    } else {
+                        i = bytes.len();
+                    }
+                } else {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            _ => {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
 }
 
 fn is_connection_closed_message(msg: &str) -> bool {
@@ -2001,7 +2324,11 @@ mod tests {
             "CREATE TABLE t ()",
             "set role admin",
         ] {
-            assert!(DatabaseManager::check_write_query(sql), "should block: {}", sql);
+            assert!(
+                DatabaseManager::check_write_query(sql),
+                "should block: {}",
+                sql
+            );
         }
     }
 
@@ -2016,7 +2343,11 @@ mod tests {
             "SAVEPOINT foo",
             "RELEASE SAVEPOINT foo",
         ] {
-            assert!(!DatabaseManager::check_write_query(sql), "should allow: {}", sql);
+            assert!(
+                !DatabaseManager::check_write_query(sql),
+                "should allow: {}",
+                sql
+            );
         }
     }
 
@@ -2030,14 +2361,22 @@ mod tests {
             "DISCARD ALL",
             "discard plans",
         ] {
-            assert!(DatabaseManager::check_session_mutating(sql), "should block: {}", sql);
+            assert!(
+                DatabaseManager::check_session_mutating(sql),
+                "should block: {}",
+                sql
+            );
         }
     }
 
     #[test]
     fn classifier_allows_non_session_statements() {
         for sql in ["SELECT 1", "INSERT INTO t VALUES (1)", "BEGIN"] {
-            assert!(!DatabaseManager::check_session_mutating(sql), "should not flag: {}", sql);
+            assert!(
+                !DatabaseManager::check_session_mutating(sql),
+                "should not flag: {}",
+                sql
+            );
         }
     }
 
@@ -2056,24 +2395,35 @@ mod tests {
             "db error: ERROR: syntax error at or near \"select\"",
             "Query error: relation \"missing\" does not exist",
         ] {
-            assert!(!is_connection_closed_message(msg), "should not match: {}", msg);
+            assert!(
+                !is_connection_closed_message(msg),
+                "should not match: {}",
+                msg
+            );
         }
     }
 
     #[test]
     fn normalize_sslmode_rewrites_verify_variants() {
-        let url = "postgresql://u:p@mydb.xyz.us-east-1.rds.amazonaws.com:5432/d?sslmode=verify-full";
+        let url =
+            "postgresql://u:p@mydb.xyz.us-east-1.rds.amazonaws.com:5432/d?sslmode=verify-full";
         assert_eq!(
             normalize_sslmode_param(url),
             "postgresql://u:p@mydb.xyz.us-east-1.rds.amazonaws.com:5432/d?sslmode=require"
         );
 
         let kv = "host=rds sslmode=verify-ca user=x";
-        assert_eq!(normalize_sslmode_param(kv), "host=rds sslmode=require user=x");
+        assert_eq!(
+            normalize_sslmode_param(kv),
+            "host=rds sslmode=require user=x"
+        );
 
         // Case-insensitive key, preserves casing of surrounding params.
         let mixed = "HOST=rds SSLMODE=Verify-Full USER=x";
-        assert_eq!(normalize_sslmode_param(mixed), "HOST=rds SSLMODE=require USER=x");
+        assert_eq!(
+            normalize_sslmode_param(mixed),
+            "HOST=rds SSLMODE=require USER=x"
+        );
 
         // Multiple query params, trailing sslmode.
         let multi = "postgresql://h/d?connect_timeout=10&sslmode=verify-ca";
@@ -2092,14 +2442,18 @@ mod tests {
             "postgresql://h/d",
             "host=h user=u",
         ] {
-            assert_eq!(normalize_sslmode_param(cs), cs, "should pass through: {}", cs);
+            assert_eq!(
+                normalize_sslmode_param(cs),
+                cs,
+                "should pass through: {}",
+                cs
+            );
         }
     }
 
     #[test]
     fn normalize_sslmode_result_parses() {
-        let rewritten =
-            normalize_sslmode_param("postgresql://u:p@h:5432/d?sslmode=verify-full");
+        let rewritten = normalize_sslmode_param("postgresql://u:p@h:5432/d?sslmode=verify-full");
         rewritten
             .parse::<PgConfig>()
             .expect("rewritten connection string should parse");
@@ -2118,8 +2472,7 @@ mod tests {
         assert!(dropped.contains(&"statusColor".to_string()));
         assert!(dropped.contains(&"tLSMode".to_string()));
         assert!(dropped.contains(&"lazyload".to_string()));
-        out.parse::<PgConfig>()
-            .expect("cleaned URL should parse");
+        out.parse::<PgConfig>().expect("cleaned URL should parse");
     }
 
     #[test]
@@ -2160,7 +2513,74 @@ mod tests {
         let (out, dropped) = strip_unsupported_url_query_params(url);
         assert_eq!(out, "postgresql://h/d");
         assert_eq!(dropped.len(), 2);
-        out.parse::<PgConfig>()
-            .expect("cleaned URL should parse");
+        out.parse::<PgConfig>().expect("cleaned URL should parse");
+    }
+
+    #[test]
+    fn single_statement_guard_allows_literals_comments_and_trailing_semicolon() {
+        for sql in [
+            "SELECT ';' AS semi",
+            "SELECT $$;$$ AS semi",
+            "SELECT 1; -- trailing comment",
+            "/* leading ; comment */ SELECT 1;",
+        ] {
+            DatabaseManager::ensure_single_statement(sql)
+                .unwrap_or_else(|e| panic!("should allow {sql:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn single_statement_guard_blocks_extra_statements() {
+        for sql in [
+            "SELECT 1; DELETE FROM users",
+            "SELECT 1; /* comment */ UPDATE users SET admin = true",
+            "SELECT $tag$;$tag$; DROP TABLE users",
+        ] {
+            assert!(
+                DatabaseManager::ensure_single_statement(sql).is_err(),
+                "should block: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_statement_semicolon_is_removed_for_wrapping() {
+        assert_eq!(
+            trim_trailing_statement_semicolon("SELECT ';' AS value; -- ok"),
+            "SELECT ';' AS value"
+        );
+    }
+
+    #[test]
+    fn readonly_escape_guard_blocks_read_write_txn_and_set_config() {
+        for sql in [
+            "BEGIN READ WRITE",
+            "start transaction isolation level repeatable read read write",
+            "SELECT set_config('default_transaction_read_only', 'off', false)",
+            "SELECT pg_catalog.set_config('statement_timeout', '0', false)",
+        ] {
+            assert!(
+                DatabaseManager::check_readonly_escape(sql),
+                "should block: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn unconditional_where_guard_blocks_only_plain_tautologies() {
+        assert!(is_unconditional_where("TRUE"));
+        assert!(is_unconditional_where("(1 = 1)"));
+        assert!(!is_unconditional_where("id = 1"));
+        assert!(!is_unconditional_where("TRUE AND id = 1"));
+    }
+
+    #[test]
+    fn sql_literal_redaction_masks_history_values() {
+        let redacted = redact_sql_literals(
+            "INSERT INTO users(email, note) VALUES ('alice@example.com', $x$secret;x$x$)",
+        );
+        assert!(!redacted.contains("alice@example.com"));
+        assert!(!redacted.contains("secret;x"));
+        assert!(redacted.contains("[REDACTED]"));
     }
 }
