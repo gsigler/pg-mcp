@@ -2,20 +2,125 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish as (e.g. v1.2.0). Creates a draft release."
-        required: true
-        default: "v0.0.0-manual"
+        description: "Release tag (e.g. v1.2.0). Leave empty to bump from package.json."
+        required: false
+        default: ""
+      bump:
+        description: "When tag is empty, which semver segment to increment"
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
+  version:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          current="$(node -p "require('./package.json').version")"
+
+          bump_semver() {
+            local cur="$1" kind="$2"
+            local major minor patch
+            IFS=. read -r major minor patch <<< "${cur%%-*}"
+            case "$kind" in
+              major) echo "$((major + 1)).0.0" ;;
+              minor) echo "${major}.$((minor + 1)).0" ;;
+              patch) echo "${major}.${minor}.$((patch + 1))" ;;
+              *) echo "unknown bump kind: $kind" >&2; exit 1 ;;
+            esac
+          }
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
+            version="${INPUT_TAG#v}"
+            tag="v${version}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="$(bump_semver "$current" "${INPUT_BUMP:-patch}")"
+            tag="v${version}"
+          else
+            version="$(bump_semver "$current" patch)"
+            tag="v${version}"
+          fi
+
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "Invalid version: $version" >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "current=${current}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version files
+        if: steps.meta.outputs.version != steps.meta.outputs.current
+        run: bash .github/scripts/bump-version.sh "${{ steps.meta.outputs.version }}"
+
+      - name: Commit, tag, and push
+        if: steps.meta.outputs.version != steps.meta.outputs.current
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json
+          git commit -m "chore(release): bump version to ${VERSION} [skip ci]"
+          git tag -a "${TAG}" -m "pg-mcp ${VERSION}"
+          git push origin HEAD:main
+          git push origin "${TAG}"
+
+      - name: Tag current commit when version already matches
+        if: steps.meta.outputs.version == steps.meta.outputs.current
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse "${TAG}^{commit}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "pg-mcp ${{ steps.meta.outputs.version }}"
+          git push origin "${TAG}"
+
   build:
+    needs: version
+    if: needs.version.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +142,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -57,23 +164,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Resolve tag name
-        id: tag
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build & publish
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ steps.tag.outputs.value }}
-          releaseName: "pg-mcp ${{ steps.tag.outputs.value }}"
+          tagName: ${{ needs.version.outputs.tag }}
+          releaseName: "pg-mcp ${{ needs.version.outputs.tag }}"
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

@@ -31,7 +31,7 @@ src-tauri/
   tauri.conf.json     # window, CSP, bundle config
   icons/              # generated from macos-app-icons/AppIcon1024.png via `tauri icon`
 macos-app-icons/      # source icon artifacts; regenerate bundle icons from here
-.github/workflows/release.yml   # tag-triggered cross-platform build
+.github/workflows/release.yml   # main-merge + manual release (bump, tag, cross-platform build)
 ```
 
 ## Build / test / run
@@ -121,12 +121,7 @@ Defense in depth, with the server as the source of truth. The only *real* fix is
 
 ## Release flow
 
-```sh
-git tag vX.Y.Z
-git push origin main vX.Y.Z
-```
-
-GitHub Actions builds macOS universal and Windows x64 and attaches installers to a draft release. Manually publish via the GitHub UI after reviewing release notes.
+Merging to `main` triggers `.github/workflows/release.yml`: patch bump, `v*` tag, cross-platform build, draft GitHub release. Use **workflow_dispatch** on that workflow for manual releases (explicit tag or patch/minor/major bump). Publish the draft release in the GitHub UI after review.
 
 To regenerate icons after replacing `macos-app-icons/AppIcon1024.png`:
 
