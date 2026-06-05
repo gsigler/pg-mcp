@@ -40,7 +40,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
 | Rust typecheck | `cd src-tauri && cargo check` |
 | Release bundle | `npm run tauri build` |
 
-No ESLint/Prettier scripts are configured. CI only builds releases on `v*` tags (macOS + Windows), not Linux.
+No ESLint/Prettier scripts are configured. CI runs the Release workflow on every merge to `main` (and on manual dispatch); it builds macOS + Windows, not Linux.
 
 ### Gotchas
 
