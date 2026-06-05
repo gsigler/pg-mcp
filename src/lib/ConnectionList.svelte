@@ -21,6 +21,7 @@
       {@const isActive = conn.name === config.activeConnection}
       {@const result = testResults[conn.name]}
       {@const isTesting = testingConnections[conn.name]}
+      {@const connectionUrl = `${conn.host}:${conn.port}/${conn.database || "—"}`}
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
@@ -31,8 +32,8 @@
         <span class="color-dot" style="background: {conn.color}"></span>
 
         <div class="card-main">
-          <span class="conn-name">{conn.name}</span>
-          <span class="conn-host">{conn.host}:{conn.port}/{conn.database || "—"}</span>
+          <span class="conn-name" title={conn.name}>{conn.name}</span>
+          <span class="conn-host" title={connectionUrl}>{connectionUrl}</span>
         </div>
 
         <span class="mode-badge" class:ro={conn.readonly} class:rw={!conn.readonly}>
