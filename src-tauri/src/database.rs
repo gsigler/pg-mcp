@@ -62,9 +62,10 @@ pub struct DatabaseManager {
     /// connect + hardening. Source of truth for the connection banner
     /// icon — the config flag alone can lie if enforcement regressed.
     observed_readonly: Arc<Mutex<bool>>,
-    /// `DISCARD ALL` + the full hardening SQL, memoized so post-query
-    /// reset on RO connections doesn't rebuild it each call. `None` on
-    /// read-write connections (no reset needed).
+    /// Full hardening SQL, memoized so post-query reset on RO connections
+    /// doesn't rebuild it each call. `None` on read-write connections (no
+    /// reset needed). `DISCARD ALL` is sent separately because PostgreSQL
+    /// rejects it inside a multi-statement batch.
     reset_sql: Arc<Mutex<Option<String>>>,
     /// Snapshot of non-secret connection settings. If the UI changes the
     /// active connection in place, the MCP child must reconnect so safety
@@ -138,7 +139,7 @@ impl DatabaseManager {
         }
 
         let reset_sql = if conn.readonly {
-            Some(format!("DISCARD ALL; {}", hardening_sql))
+            Some(hardening_sql)
         } else {
             None
         };
@@ -197,7 +198,10 @@ impl DatabaseManager {
         let reset_err = {
             let guard = self.client.lock().await;
             if let Some(client) = guard.as_ref() {
-                client.batch_execute(&sql).await.err()
+                match client.batch_execute("DISCARD ALL").await {
+                    Ok(_) => client.batch_execute(&sql).await.err(),
+                    Err(e) => Some(e),
+                }
             } else {
                 None
             }
@@ -344,10 +348,10 @@ impl DatabaseManager {
                 Ok(format_rows_opt(&rows, redact))
             }
             Err(e) => {
-                let err = format!("Query error: {}", e);
+                let connection_lost = self.clear_stale_client_after_error(&e).await;
+                let err = format_pg_error("Query error", &e, connection_lost);
                 self.record_query(sql, duration_ms, None, Some(err.clone()))
                     .await;
-                self.clear_stale_client_after_error(&e).await;
                 Err(err)
             }
         };
@@ -391,7 +395,7 @@ impl DatabaseManager {
             } else {
                 client.batch_execute("BEGIN").await
             };
-            open_res.map_err(|e| format!("Failed to open write guard: {}", e))?;
+            open_res.map_err(|e| format_pg_error("Failed to open write guard", &e, false))?;
 
             let result = client.query(sql, params).await;
             let duration_ms = start.elapsed().as_millis();
@@ -427,7 +431,7 @@ impl DatabaseManager {
                         client
                             .batch_execute(&commit_sql)
                             .await
-                            .map_err(|e| format!("Failed to commit write: {}", e))?;
+                            .map_err(|e| format_pg_error("Failed to commit write", &e, false))?;
                         self.record_query(sql, duration_ms, Some(row_count as usize), None)
                             .await;
                         Ok(format_rows_opt(&rows, redact))
@@ -435,7 +439,7 @@ impl DatabaseManager {
                 }
                 Err(e) => {
                     let _ = client.batch_execute(&undo_sql).await;
-                    let err = format!("Query error: {}", e);
+                    let err = format_pg_error("Query error", &e, false);
                     self.record_query(sql, duration_ms, None, Some(err.clone()))
                         .await;
                     stale_error = Some(e);
@@ -493,7 +497,7 @@ impl DatabaseManager {
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+            .map_err(|e| format_pg_error("Failed to begin transaction", &e, false))?;
 
         *self.in_transaction.lock().await = true;
         Ok("Transaction started.".into())
@@ -510,7 +514,7 @@ impl DatabaseManager {
             client
                 .execute("COMMIT", &[])
                 .await
-                .map_err(|e| format!("Failed to commit: {}", e))?;
+                .map_err(|e| format_pg_error("Failed to commit", &e, false))?;
         }
 
         *self.in_transaction.lock().await = false;
@@ -531,7 +535,7 @@ impl DatabaseManager {
             client
                 .execute("ROLLBACK", &[])
                 .await
-                .map_err(|e| format!("Failed to rollback: {}", e))?;
+                .map_err(|e| format_pg_error("Failed to rollback", &e, false))?;
         }
 
         *self.in_transaction.lock().await = false;
@@ -753,7 +757,7 @@ impl DatabaseManager {
         let col_rows = client
             .query(col_sql, &[&schema, &tbl])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
 
         output.push_str("Columns:\n");
         output.push_str(&format_rows(&col_rows));
@@ -805,7 +809,7 @@ impl DatabaseManager {
         let idx_rows = client
             .query(idx_sql, &[&schema, &tbl])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
         if !idx_rows.is_empty() {
             output.push_str("\nIndexes:\n");
             output.push_str(&format_rows(&idx_rows));
@@ -827,7 +831,7 @@ impl DatabaseManager {
         let fk_rows = client
             .query(fk_sql, &[&schema, &tbl])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
         if !fk_rows.is_empty() {
             output.push_str("\nOutgoing Foreign Keys:\n");
             output.push_str(&format_rows(&fk_rows));
@@ -849,7 +853,7 @@ impl DatabaseManager {
         let rfk_rows = client
             .query(rfk_sql, &[&schema, &tbl])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
         if !rfk_rows.is_empty() {
             output.push_str("\nIncoming Foreign Keys (tables referencing this one):\n");
             output.push_str(&format_rows(&rfk_rows));
@@ -880,7 +884,7 @@ impl DatabaseManager {
                 &[&schema, &tbl],
             )
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
 
         let (approx_rows, description, relkind): (i64, Option<String>, i8) = match meta {
             Some(row) => (row.get(0), row.get(1), row.get::<_, i8>(2)),
@@ -932,7 +936,7 @@ impl DatabaseManager {
                 &[&schema, &tbl],
             )
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
 
         let mut output = format!("{}.{}{} (~{} rows)", schema, tbl, kind_label, approx_rows);
         if let Some(d) = description.filter(|s| !s.is_empty()) {
@@ -1049,7 +1053,7 @@ impl DatabaseManager {
         let rows = client
             .query(&sql, &params)
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
         Ok(format_rows(&rows))
     }
 
@@ -1061,7 +1065,7 @@ impl DatabaseManager {
         let row = client
             .query_one("SELECT version()", &[])
             .await
-            .map_err(|e| format!("Query failed: {}", e))?;
+            .map_err(|e| format_pg_error("Query failed", &e, false))?;
         let version: String = row.get(0);
         let latency = start.elapsed().as_millis();
         let observed = query_transaction_read_only(&client).await.unwrap_or(false);
@@ -1083,7 +1087,7 @@ impl DatabaseManager {
         let rows = client
             .query(sql, &[])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
         Ok(format_rows(&rows))
     }
 
@@ -1118,7 +1122,7 @@ impl DatabaseManager {
         let col_rows = client
             .query(col_sql, &[&schema])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
 
         let fk_sql = "SELECT tc.table_name, kcu.column_name, \
                     ccu.table_name AS foreign_table, ccu.column_name AS foreign_column \
@@ -1131,7 +1135,7 @@ impl DatabaseManager {
         let fk_rows = client
             .query(fk_sql, &[&schema])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
 
         let mut tables: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
         for row in &col_rows {
@@ -1191,7 +1195,7 @@ impl DatabaseManager {
         let hdr = client
             .query_one("SELECT current_database(), version()", &[])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
         let db_name: String = hdr.get(0);
         let version: String = hdr.get(1);
         let short_ver = version.split(" on ").next().unwrap_or(&version);
@@ -1215,7 +1219,7 @@ impl DatabaseManager {
                 &[],
             )
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
         if !schemas.is_empty() {
             let parts: Vec<String> = schemas
                 .iter()
@@ -1248,7 +1252,7 @@ impl DatabaseManager {
                 &[&top_n],
             )
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
 
         if top_tables.is_empty() {
             output.push_str("No user tables found.\n");
@@ -1305,7 +1309,7 @@ impl DatabaseManager {
                     &[&schema, &name],
                 )
                 .await
-                .map_err(|e| format!("Query error: {}", e))?;
+                .map_err(|e| format_pg_error("Query error", &e, false))?;
 
             if !cols.is_empty() {
                 let parts: Vec<String> = cols
@@ -1365,7 +1369,7 @@ impl DatabaseManager {
                 &[],
             )
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
         if !fks.is_empty() {
             output.push_str("\nRELATIONSHIPS (first 30):\n");
             for row in &fks {
@@ -1438,7 +1442,7 @@ impl DatabaseManager {
         let rows = client
             .query(sql, &[&query, &comment_pat, &limit])
             .await
-            .map_err(|e| format!("Query error: {}", e))?;
+            .map_err(|e| format_pg_error("Query error", &e, false))?;
 
         if rows.is_empty() {
             return Ok(format!(
@@ -1526,7 +1530,7 @@ impl DatabaseManager {
         }
     }
 
-    async fn clear_stale_client_after_error(&self, err: &PgError) {
+    async fn clear_stale_client_after_error(&self, err: &PgError) -> bool {
         let client_closed = self
             .client
             .lock()
@@ -1534,13 +1538,15 @@ impl DatabaseManager {
             .as_ref()
             .map(|client| client.is_closed())
             .unwrap_or(false);
-        if client_closed || is_connection_closed_message(&err.to_string()) {
+        let connection_lost = client_closed || pg_error_indicates_connection_lost(err);
+        if connection_lost {
             log::info!(
                 "[pg-mcp] clearing stale database connection after error: {}",
                 err
             );
             self.disconnect().await;
         }
+        connection_lost
     }
 
     pub async fn get_query_history(&self, limit: usize) -> String {
@@ -2291,9 +2297,34 @@ fn redact_sql_literals(sql: &str) -> String {
     out
 }
 
+fn format_pg_error(context: &str, err: &PgError, connection_lost: bool) -> String {
+    if connection_lost || pg_error_indicates_connection_lost(err) {
+        format!("{}: database connection lost ({})", context, err)
+    } else {
+        format!("{}: {}", context, err)
+    }
+}
+
+fn pg_error_indicates_connection_lost(err: &PgError) -> bool {
+    err.code()
+        .map(|code| {
+            let code = code.code();
+            code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03")
+        })
+        .unwrap_or(false)
+        || DatabaseManager::is_connection_lost_error_text(&err.to_string())
+}
+
+impl DatabaseManager {
+    pub fn is_connection_lost_error_text(msg: &str) -> bool {
+        is_connection_closed_message(msg)
+    }
+}
+
 fn is_connection_closed_message(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    lower.contains("connection closed")
+    lower.contains("database connection lost")
+        || lower.contains("connection closed")
         || lower.contains("server closed the connection")
         || lower.contains("connection reset")
         || lower.contains("broken pipe")

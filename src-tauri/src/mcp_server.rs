@@ -333,28 +333,28 @@ impl McpServer {
         let config = Config::load();
         *self.config.lock().await = config.clone();
 
-        let result = match tool_name {
-            "list_connections" => self.tool_list_connections(&config).await,
-            "query" => self.tool_query(&config, &arguments).await,
-            "list_tables" => self.tool_list_tables(&config, &arguments).await,
-            "describe_table" => self.tool_describe_table(&config, &arguments).await,
-            "describe_tables" => self.tool_describe_tables(&config, &arguments).await,
-            "list_schemas" => self.tool_list_schemas(&config).await,
-            "test_connection" => self.tool_test_connection(&config).await,
-            "get_table_sample" => self.tool_get_table_sample(&config, &arguments).await,
-            "get_schema_diagram" => self.tool_get_schema_diagram(&config, &arguments).await,
-            "insert_rows" => self.tool_insert_rows(&config, &arguments).await,
-            "update_rows" => self.tool_update_rows(&config, &arguments).await,
-            "delete_rows" => self.tool_delete_rows(&config, &arguments).await,
-            "begin_transaction" => self.tool_begin_transaction(&config, &arguments).await,
-            "commit" => self.tool_commit(&config).await,
-            "rollback" => self.tool_rollback(&config).await,
-            "explain_query" => self.tool_explain_query(&config, &arguments).await,
-            "query_history" => self.tool_query_history(&arguments).await,
-            "db_overview" => self.tool_db_overview(&config, &arguments).await,
-            "search_schema" => self.tool_search_schema(&config, &arguments).await,
-            _ => Err(format!("Unknown tool: {}", tool_name)),
-        };
+        let mut result = self
+            .dispatch_tool_call(tool_name, &config, &arguments)
+            .await;
+        if let Err(err) = &result {
+            if DatabaseManager::is_connection_lost_error_text(err) {
+                let was_in_transaction = self.db.in_transaction().await;
+                self.db.disconnect().await;
+                if !was_in_transaction
+                    && Self::can_retry_after_connection_loss(tool_name, &arguments, &config)
+                {
+                    log::info!(
+                        "[pg-mcp] retrying '{}' once after database connection loss",
+                        tool_name
+                    );
+                    let retry_config = Config::load();
+                    *self.config.lock().await = retry_config.clone();
+                    result = self
+                        .dispatch_tool_call(tool_name, &retry_config, &arguments)
+                        .await;
+                }
+            }
+        }
 
         match result {
             Ok(text) => json!({
@@ -368,7 +368,62 @@ impl McpServer {
         }
     }
 
+    async fn dispatch_tool_call(
+        &self,
+        tool_name: &str,
+        config: &Config,
+        arguments: &Value,
+    ) -> Result<String, String> {
+        match tool_name {
+            "list_connections" => self.tool_list_connections(config).await,
+            "query" => self.tool_query(config, arguments).await,
+            "list_tables" => self.tool_list_tables(config, arguments).await,
+            "describe_table" => self.tool_describe_table(config, arguments).await,
+            "describe_tables" => self.tool_describe_tables(config, arguments).await,
+            "list_schemas" => self.tool_list_schemas(config).await,
+            "test_connection" => self.tool_test_connection(config).await,
+            "get_table_sample" => self.tool_get_table_sample(config, arguments).await,
+            "get_schema_diagram" => self.tool_get_schema_diagram(config, arguments).await,
+            "insert_rows" => self.tool_insert_rows(config, arguments).await,
+            "update_rows" => self.tool_update_rows(config, arguments).await,
+            "delete_rows" => self.tool_delete_rows(config, arguments).await,
+            "begin_transaction" => self.tool_begin_transaction(config, arguments).await,
+            "commit" => self.tool_commit(config).await,
+            "rollback" => self.tool_rollback(config).await,
+            "explain_query" => self.tool_explain_query(config, arguments).await,
+            "query_history" => self.tool_query_history(arguments).await,
+            "db_overview" => self.tool_db_overview(config, arguments).await,
+            "search_schema" => self.tool_search_schema(config, arguments).await,
+            _ => Err(format!("Unknown tool: {}", tool_name)),
+        }
+    }
+
     // ─── Helpers ────────────────────────────────────────────────────
+
+    fn can_retry_after_connection_loss(tool_name: &str, args: &Value, config: &Config) -> bool {
+        match tool_name {
+            "list_tables" | "describe_table" | "describe_tables" | "list_schemas"
+            | "get_table_sample" | "get_schema_diagram" | "db_overview" | "search_schema" => true,
+            "explain_query" => !args
+                .get("analyze")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+            "query" => {
+                let Some(sql) = args.get("sql").and_then(|s| s.as_str()) else {
+                    return false;
+                };
+                let active_is_readonly = config
+                    .get_active_connection()
+                    .map(|conn| conn.readonly)
+                    .unwrap_or(false);
+                active_is_readonly
+                    && !DatabaseManager::check_write_query(sql)
+                    && !DatabaseManager::check_session_mutating(sql)
+                    && !DatabaseManager::check_readonly_escape(sql)
+            }
+            _ => false,
+        }
+    }
 
     /// Build the header banner shown above every tool response.
     ///
