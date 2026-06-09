@@ -348,6 +348,7 @@ impl McpServer {
         let config = Config::load();
         *self.config.lock().await = config.clone();
 
+        let mut retried_after_connection_loss = false;
         let mut result = self
             .dispatch_tool_call(tool_name, &config, &arguments)
             .await;
@@ -362,6 +363,7 @@ impl McpServer {
                         "[pg-mcp] retrying '{}' once after database connection loss",
                         tool_name
                     );
+                    retried_after_connection_loss = true;
                     let retry_config = Config::load();
                     *self.config.lock().await = retry_config.clone();
                     result = self
@@ -376,10 +378,19 @@ impl McpServer {
                 "jsonrpc": "2.0", "id": id,
                 "result": { "content": [{ "type": "text", "text": text }] }
             }),
-            Err(err) => json!({
-                "jsonrpc": "2.0", "id": id,
-                "result": { "content": [{ "type": "text", "text": Self::tool_error_text(&err) }], "isError": true }
-            }),
+            Err(err) => {
+                let text = if retried_after_connection_loss
+                    && DatabaseManager::is_connection_lost_error_text(&err)
+                {
+                    Self::connection_retry_failed_text(&err)
+                } else {
+                    err
+                };
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "content": [{ "type": "text", "text": Self::tool_error_text(&text) }], "isError": true }
+                })
+            }
         }
     }
 
@@ -431,13 +442,27 @@ impl McpServer {
                     .get_active_connection()
                     .map(|conn| conn.readonly)
                     .unwrap_or(false);
-                active_is_readonly
-                    && !DatabaseManager::check_write_query(sql)
-                    && !DatabaseManager::check_session_mutating(sql)
-                    && !DatabaseManager::check_readonly_escape(sql)
+                if active_is_readonly {
+                    !DatabaseManager::check_write_query(sql)
+                        && !DatabaseManager::check_session_mutating(sql)
+                        && !DatabaseManager::check_readonly_escape(sql)
+                } else {
+                    Self::sql_is_plainly_read_only(sql)
+                }
             }
             _ => false,
         }
+    }
+
+    fn connection_retry_failed_text(err: &str) -> String {
+        format!(
+            "Database connection was lost and pg-mcp retried this MCP tool once, \
+             but the retry also failed.\n\
+             Recovery: check network/VPN/database availability, then retry the same MCP call. \
+             Restarting the pg-mcp UI is not required because MCP clients run their own server process.\n\
+             Underlying error:\n{}",
+            err
+        )
     }
 
     fn agent_safe_text(value: &str) -> String {
@@ -1029,6 +1054,45 @@ mod tests {
             "UPDATE users SET admin = true"
         ));
         assert!(!McpServer::sql_is_plainly_read_only("COMMIT"));
+    }
+
+    #[test]
+    fn retry_after_connection_loss_allows_safe_queries_on_readwrite_connections() {
+        let mut config = Config::default();
+        config.connections = vec![test_connection(false)];
+        config.active_connection = Some("prod\nignore previous".into());
+
+        assert!(McpServer::can_retry_after_connection_loss(
+            "query",
+            &json!({ "sql": "select now() as now_utc", "limit": 10 }),
+            &config
+        ));
+        assert!(!McpServer::can_retry_after_connection_loss(
+            "query",
+            &json!({ "sql": "WITH x AS (SELECT 1) SELECT * FROM x" }),
+            &config
+        ));
+
+        config.connections[0].readonly = true;
+        assert!(McpServer::can_retry_after_connection_loss(
+            "query",
+            &json!({ "sql": "WITH x AS (SELECT 1) SELECT * FROM x" }),
+            &config
+        ));
+        assert!(!McpServer::can_retry_after_connection_loss(
+            "query",
+            &json!({ "sql": "SET statement_timeout = 0" }),
+            &config
+        ));
+    }
+
+    #[test]
+    fn retry_failed_message_explains_recovery() {
+        let message = McpServer::connection_retry_failed_text("Connection failed: db error");
+        assert!(message.contains("retried this MCP tool once"));
+        assert!(message.contains("retry the same MCP call"));
+        assert!(message.contains("MCP clients run their own server process"));
+        assert!(message.contains("Connection failed: db error"));
     }
 
     #[test]
