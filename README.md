@@ -1,115 +1,99 @@
 # pg-mcp
 
-A PostgreSQL MCP server with a native desktop config UI.
+pg-mcp gives AI coding agents a safer, friendlier way to work with PostgreSQL.
 
-Runs as a Tauri app on macOS and Windows. You manage connections in the UI; Claude Desktop, Claude Code, and other MCP clients talk to the server over stdio and see whichever database you've marked active — no `.mcp.json` juggling, no per-project credentials, no guessing which environment the agent is pointed at.
+It is a small desktop app for managing database connections plus an MCP server that Claude, Cursor, VS Code, Codex, and other MCP clients can call over stdio. Pick the active database in the app, then your agent gets schema tools, query tools, and clear guardrails without copying credentials into project config files.
 
-## Highlights
+## Why use it?
 
-- **Deliberate DB selection.** The agent can list connections and sees a banner on every tool response naming the active one, but it cannot switch databases. You pick, always.
-- **Secrets in the OS keychain.** Passwords and connection strings live in macOS Keychain or Windows Credential Manager. `config.json` never holds secrets.
-- **Server-enforced read-only.** Read-only connections open with `default_transaction_read_only = on` in the libpq startup packet, catching CTE writes, side-effecting functions, and `pg_terminate_backend` — things a first-token keyword check would miss.
-- **TLS that means it.** The `ssl` toggle wires up `postgres-native-tls` for end-to-end encryption against remote databases.
-- **Data-loss guard on destructive ops.** `update_rows` and `delete_rows` require an `expected_max_rows` argument; if the affected count exceeds it, the statement is rolled back. A mistyped WHERE doesn't wipe a table.
-- **Optional PII redaction.** A per-connection toggle replaces cells whose column name or value looks like PII (email, phone, SSN, card-shaped digits, name-ish columns) with `[REDACTED]` before the response leaves the server.
-- **Audit log.** Every query from every agent lands in `pg-mcp.log` tagged with a session UUID. `tail -f` to watch what your agents are doing.
-- **`application_name` tagged.** Agents show up in `pg_stat_activity` as `pg-mcp/<session>/<connection>`, so DBAs can tell them apart.
+- **You stay in control.** Agents can see which connection is active, but they cannot switch databases for you.
+- **Credentials stay local.** Passwords and connection strings are stored in macOS Keychain or Windows Credential Manager.
+- **Read-only mode is enforced.** Read-only connections are opened with PostgreSQL's transaction read-only setting enabled from the start.
+- **Destructive writes have a row cap.** `update_rows` and `delete_rows` require `expected_max_rows` so a bad filter can be rolled back before it does too much damage.
+- **PII can be redacted.** A per-connection toggle hides cells that look like emails, phone numbers, SSNs, credit-card-like values, or name-ish fields.
+- **Every query is auditable.** The local audit log records agent queries with session IDs.
+- **Remote databases can use TLS.** Turn on SSL for encrypted Postgres connections.
 
 ## Install
 
-### From a release
+1. Download the macOS `.dmg` or Windows `.msi` from the [latest release](https://github.com/gsigler/pg-mcp/releases).
+2. Open the installer and move pg-mcp into your Applications folder on macOS, or follow the Windows installer prompts.
+3. Launch pg-mcp and add your PostgreSQL connection.
+4. Open **Agent Setup** and install pg-mcp into your MCP client.
+5. Restart the client so it picks up the new MCP server.
 
-Grab the macOS `.dmg` or Windows `.msi` from the [latest release](https://github.com/gsigler/pg-mcp/releases) and run the installer.
+The Agent Setup panel can install pg-mcp for Claude Desktop, Claude Code, Cursor, VS Code, and Codex. It also includes copy-paste config for other MCP clients.
 
-### Register with your agent
+### macOS: opening the unsigned build
 
-Open pg-mcp, add a connection, then use the **Agent Setup** panel for one-click install into:
+The macOS build is not yet signed or notarized by Apple, so Gatekeeper may block it the first time you open it.
 
-- **Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Claude Code** — `~/.claude.json` (user scope)
-- **Cursor** — `~/.cursor/mcp.json`
-- **VS Code** — `~/Library/Application Support/Code/User/mcp.json` (VS Code uses `servers` rather than `mcpServers`, and entries need `"type": "stdio"`)
-- **Codex** — `~/.codex/config.toml` (one file covers the Codex CLI, IDE extension, and desktop app)
+If macOS says the app cannot be opened:
 
-Restart the target after installing. For Zed, Cline, or any other client, expand **Manual setup / other clients** in the panel for copy-paste snippets.
+1. Make sure you downloaded pg-mcp from the official release page.
+2. In Finder, Control-click `pg-mcp.app` and choose **Open**.
+3. Click **Open** again in the confirmation dialog.
 
-### Build from source
+If macOS only shows a warning in System Settings:
+
+1. Open **System Settings** > **Privacy & Security**.
+2. Scroll to the security message about pg-mcp.
+3. Click **Open Anyway**, then confirm.
+
+You should only need to do this once for each downloaded build.
+
+## How it works
+
+pg-mcp has two modes in one app:
+
+- Launch it normally to manage connections in the desktop UI.
+- MCP clients launch the same binary with `serve` to talk to PostgreSQL over stdio.
+
+Every tool response starts with a banner showing the active connection, host, read/write mode, and PII redaction state. If you change the active connection in the UI, the next MCP tool call uses the new selection.
+
+## What agents can do
+
+pg-mcp gives agents practical Postgres tools without making them memorize your schema:
+
+- List configured connections and identify the active one.
+- Get a database overview with schemas, large tables, columns, samples, and foreign keys.
+- Search table and column names.
+- Describe schemas, tables, indexes, relationships, and JSONB keys.
+- Run SQL queries with pagination.
+- Sample table rows.
+- Generate a text ER diagram.
+- Test connection health.
+- Insert, update, and delete rows with guardrails.
+- Run `EXPLAIN` and `EXPLAIN ANALYZE`.
+- Review recent query history for the current MCP process.
+
+## A few safety tips
+
+- Use a least-privilege Postgres role instead of a superuser.
+- Prefer read-only roles or read replicas for agent analysis work.
+- Turn on SSL for remote databases.
+- Rotate credentials in your normal password or cloud-secret workflow.
+
+pg-mcp adds helpful guardrails, but Postgres permissions are still the source of truth.
+
+## Build from source
+
+You need Node 20+, Rust stable, and the normal Tauri platform prerequisites.
 
 ```sh
-# Prereqs: Node 20+, Rust stable (rustup or Homebrew), Xcode CLI tools on macOS
 git clone https://github.com/gsigler/pg-mcp.git
 cd pg-mcp
 npm install
-npm run tauri build   # or: npm run tauri dev
+npm run tauri build
 ```
 
-The binary does double duty: with no arguments it launches the UI; with `serve` it speaks MCP over stdio.
-
-## Tool reference
-
-Every tool response begins with a banner naming the active connection, its host, read/write mode, and whether PII redaction is on.
-
-| Tool | What it does |
-|---|---|
-| `list_connections` | All configured connections, marking the active one. |
-| `db_overview` | Single-call orientation: version, schemas, top N tables by size with column summary and 3-row samples, FK summary. Call this first on an unfamiliar DB. |
-| `search_schema` | Ranked search over table and column names and comments. Use when you know *what* you're looking for but not *where* it lives. |
-| `query` | Run raw SQL. Write statements are blocked on read-only connections. Supports `limit` and `offset` for pagination. |
-| `list_tables` | Tables and views by schema. Optional approximate row counts. |
-| `list_schemas` | Non-system schemas with table and view counts. |
-| `describe_table` | Columns (with comments), indexes, incoming and outgoing foreign keys, approximate row count, JSONB key sampling. `format: "brief"` collapses output to a two-line `col:type PK →fk` summary. |
-| `describe_tables` | Brief-mode describe for an array of tables in one call. |
-| `get_table_sample` | Up to 50 sample rows. |
-| `get_schema_diagram` | Text ER diagram. |
-| `test_connection` | Version and latency probe. |
-| `insert_rows` | Structured insert. Values are dollar-quoted so cell content can't inject SQL. |
-| `update_rows` | Structured update. Requires `expected_max_rows`; exceeding it rolls back. |
-| `delete_rows` | Structured delete. Requires `expected_max_rows`; exceeding it rolls back. |
-| `begin_transaction` / `commit` / `rollback` | Explicit transaction control. |
-| `explain_query` | `EXPLAIN` or `EXPLAIN ANALYZE`. `ANALYZE` of a suspected write is refused on read-only connections. |
-| `query_history` | In-memory ring of the last 200 queries from the current MCP process. |
-
-## Security model
-
-pg-mcp is built to avoid being a foot-gun on top of whatever you already do at the database level. Database-side hygiene is still on you:
-
-- **Connect as a least-privilege role**, not a superuser. Nothing pg-mcp does can save you from `DROP DATABASE` if the role has that privilege.
-- **Prefer a read replica for analytics access.** Read-only mode is enforced server-side via `default_transaction_read_only = on`, but a role with `BYPASSRLS` still bypasses row-level security.
-- **Enable TLS on remote connections** with the SSL toggle.
-- **Rotate credentials** via the keychain or your cloud provider's IAM. pg-mcp holds static secrets only — it doesn't auto-refresh tokens.
-
-## Concurrency
-
-Each agent session spawns its own `pg-mcp serve` child process. Concurrency between agents is by process isolation — they don't share in-memory state. Two agents querying the same database is fine; Postgres handles it. The audit log captures every query from every agent tagged by session UUID.
-
-If you flip the active connection in the UI while a child is mid-query, the current query finishes on the old DB and the next tool call picks up the new one. The UI is single-instance: relaunching focuses the open window.
-
-## Paths
-
-|  | macOS | Windows |
-|---|---|---|
-| Config (no secrets, 0600 on Unix) | `~/Library/Application Support/pg-mcp/config.json` | `%APPDATA%\pg-mcp\config.json` |
-| Secrets | Keychain, service `pg-mcp` | Credential Manager, service `pg-mcp` |
-| Audit log (append-only JSON lines) | `~/Library/Application Support/pg-mcp/pg-mcp.log` | `%APPDATA%\pg-mcp\pg-mcp.log` |
-
-## Development
+For development:
 
 ```sh
-npm run tauri dev            # UI with hot reload
-cd src-tauri && cargo test   # Rust unit tests (PII heuristics, etc.)
-cd src-tauri && cargo check  # Quick type check
+npm run tauri dev
+cd src-tauri && cargo test
+cd src-tauri && cargo check
 ```
-
-## Release process
-
-Every merge to `main` runs the **Release** workflow: it bumps the patch version in app metadata, commits with `[skip ci]`, tags `vX.Y.Z`, builds macOS universal and Windows x64 installers, and opens a draft GitHub release.
-
-To cut a release without merging (or to choose the version), run **Release** manually from the Actions tab:
-
-- **Tag** — set an explicit tag (e.g. `v1.2.0`) to release that version; files are bumped if they still show an older version.
-- **Bump** — when tag is empty, increment `patch`, `minor`, or `major` from the current `package.json` version.
-
-After the workflow finishes, review the draft release in GitHub and publish it manually.
 
 ## License
 
