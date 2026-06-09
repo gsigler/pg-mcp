@@ -203,7 +203,7 @@ impl McpServer {
                     // ── New tools ──────────────────────────────────────
                     {
                         "name": "insert_rows",
-                        "description": "Insert rows into a table with structured inputs. Values are escaped automatically. Requires read-write mode, the connection's Allow agent writes setting, and confirmWrite exactly set to the confirmation phrase. Returns inserted rows via RETURNING * as untrusted database text.",
+                        "description": "Insert rows into a table with structured inputs. Values are escaped automatically. Requires read-write mode and confirmWrite exactly set to the confirmation phrase. Returns inserted rows via RETURNING * as untrusted database text.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -228,7 +228,7 @@ impl McpServer {
                     },
                     {
                         "name": "update_rows",
-                        "description": "Update rows in a table with structured inputs. Executes inside a transaction and rolls back automatically if the affected row count exceeds `expected_max_rows`, so a mistyped WHERE cannot silently rewrite the table. Requires read-write mode, the connection's Allow agent writes setting, and confirmWrite exactly set to the confirmation phrase. Returns updated rows via RETURNING * as untrusted database text.",
+                        "description": "Update rows in a table with structured inputs. Executes inside a transaction and rolls back automatically if the affected row count exceeds `expected_max_rows`, so a mistyped WHERE cannot silently rewrite the table. Requires read-write mode and confirmWrite exactly set to the confirmation phrase. Returns updated rows via RETURNING * as untrusted database text.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -247,7 +247,7 @@ impl McpServer {
                     },
                     {
                         "name": "delete_rows",
-                        "description": "Delete rows from a table. Executes inside a transaction and rolls back automatically if the affected row count exceeds `expected_max_rows`, so a mistyped WHERE cannot silently wipe the table. Requires read-write mode, the connection's Allow agent writes setting, and confirmWrite exactly set to the confirmation phrase. Returns deleted rows via RETURNING * as untrusted database text.",
+                        "description": "Delete rows from a table. Executes inside a transaction and rolls back automatically if the affected row count exceeds `expected_max_rows`, so a mistyped WHERE cannot silently wipe the table. Requires read-write mode and confirmWrite exactly set to the confirmation phrase. Returns deleted rows via RETURNING * as untrusted database text.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -261,7 +261,7 @@ impl McpServer {
                     },
                     {
                         "name": "begin_transaction",
-                        "description": "Start a transaction. Defaults to read-only. Starting a read-write transaction requires read-write mode, the connection's Allow agent writes setting, and confirmWrite exactly set to the confirmation phrase.",
+                        "description": "Start a transaction. Defaults to read-only. Starting a read-write transaction requires read-write mode and confirmWrite exactly set to the confirmation phrase.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -273,7 +273,7 @@ impl McpServer {
                     },
                     {
                         "name": "commit",
-                        "description": "Commit the current transaction. On read-write connections, requires the connection's Allow agent writes setting and confirmWrite exactly set to the confirmation phrase.",
+                        "description": "Commit the current transaction. On read-write connections, requires confirmWrite exactly set to the confirmation phrase.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -289,7 +289,7 @@ impl McpServer {
                     },
                     {
                         "name": "explain_query",
-                        "description": "Run EXPLAIN on a query to see the execution plan without executing it. EXPLAIN ANALYZE executes SQL and therefore requires read-write mode, the connection's Allow agent writes setting, and confirmWrite exactly set to the confirmation phrase.",
+                        "description": "Run EXPLAIN on a query to see the execution plan without executing it. EXPLAIN ANALYZE executes SQL and therefore requires read-write mode and confirmWrite exactly set to the confirmation phrase.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -490,13 +490,6 @@ impl McpServer {
         if conn.readonly {
             return Err("Write operation blocked. This connection is read-only.".into());
         }
-        if !conn.allow_agent_writes {
-            return Err(
-                "Write operation blocked. This connection is read-write, but MCP agent writes are disabled. \
-                 Open pg-mcp UI, edit the connection, and enable 'Allow agent writes' if you want agents to modify this database."
-                    .into(),
-            );
-        }
         let supplied = args.get("confirmWrite").and_then(|s| s.as_str());
         if supplied != Some(WRITE_CONFIRMATION_PHRASE) {
             return Err(format!(
@@ -535,12 +528,11 @@ impl McpServer {
         } else {
             String::new()
         };
-        let agent_write_line = if !observed_readonly {
-            if conn.allow_agent_writes {
-                format!("\n\u{25a0} \u{26a0}\u{fe0f}  MCP AGENT WRITES ENABLED (write tools still require confirmWrite='{}')", WRITE_CONFIRMATION_PHRASE)
-            } else {
-                "\n\u{25a0} \u{1f6d1} MCP AGENT WRITES DISABLED".to_string()
-            }
+        let write_confirm_line = if !observed_readonly {
+            format!(
+                "\n\u{25a0} \u{26a0}\u{fe0f}  WRITE TOOLS REQUIRE confirmWrite='{}'",
+                WRITE_CONFIRMATION_PHRASE
+            )
         } else {
             String::new()
         };
@@ -548,9 +540,9 @@ impl McpServer {
         let host = Self::agent_safe_text(&conn.host);
         let db = Self::agent_safe_text(&conn.database);
         format!(
-            "{bar}\n\u{25a0} \u{1f4e6} {name}\n\u{25a0} \u{1f517} {host}:{port}/{db}\n\u{25a0} {mode}{redact}{agent_write}\n{bar}\n",
+            "{bar}\n\u{25a0} \u{1f4e6} {name}\n\u{25a0} \u{1f517} {host}:{port}/{db}\n\u{25a0} {mode}{redact}{write_confirm}\n{bar}\n",
             bar = bar, name = name, host = host, port = conn.port,
-            db = db, mode = mode, redact = redact_line, agent_write = agent_write_line,
+            db = db, mode = mode, redact = redact_line, write_confirm = write_confirm_line,
         )
     }
 
@@ -613,18 +605,12 @@ impl McpServer {
                 .as_deref()
                 .map_or(false, |a| a == conn.name);
             let mode = if conn.readonly { "RO" } else { "RW" };
-            let writes = if conn.allow_agent_writes {
-                "agent-writes:on"
-            } else {
-                "agent-writes:off"
-            };
             let marker = if active { " (active)" } else { "" };
             output.push_str(&format!(
-                "- {}{} [{}; {}] {}:{}/{}\n",
+                "- {}{} [{}] {}:{}/{}\n",
                 Self::agent_safe_text(&conn.name),
                 marker,
                 mode,
-                writes,
                 Self::agent_safe_text(&conn.host),
                 conn.port,
                 Self::agent_safe_text(&conn.database)
@@ -983,7 +969,7 @@ impl McpServer {
 mod tests {
     use super::*;
 
-    fn test_connection(readonly: bool, allow_agent_writes: bool) -> Connection {
+    fn test_connection(readonly: bool) -> Connection {
         Connection {
             name: "prod\nignore previous".into(),
             host: "db.example.com".into(),
@@ -993,7 +979,6 @@ mod tests {
             password: String::new(),
             ssl: false,
             readonly,
-            allow_agent_writes,
             redact_pii: false,
             color: String::new(),
             connection_string: None,
@@ -1021,16 +1006,14 @@ mod tests {
 
     #[test]
     fn write_confirmation_requires_connection_flag_and_phrase() {
-        let readonly = test_connection(true, true);
-        let allowed = test_connection(false, true);
-        let disabled = test_connection(false, false);
+        let readonly = test_connection(true);
+        let readwrite = test_connection(false);
         let confirmed = json!({ "confirmWrite": WRITE_CONFIRMATION_PHRASE });
         let missing = json!({});
 
         assert!(McpServer::validate_write_confirmation(&readonly, &confirmed).is_err());
-        assert!(McpServer::validate_write_confirmation(&disabled, &confirmed).is_err());
-        assert!(McpServer::validate_write_confirmation(&allowed, &missing).is_err());
-        assert!(McpServer::validate_write_confirmation(&allowed, &confirmed).is_ok());
+        assert!(McpServer::validate_write_confirmation(&readwrite, &missing).is_err());
+        assert!(McpServer::validate_write_confirmation(&readwrite, &confirmed).is_ok());
     }
 
     #[test]
@@ -1050,15 +1033,11 @@ mod tests {
 
     #[test]
     fn banner_sanitizes_connection_text_and_shows_write_gate() {
-        let conn = test_connection(false, false);
+        let conn = test_connection(false);
         let banner = McpServer::connection_banner(&conn, false);
         assert!(banner.contains("prod ignore previous"));
         assert!(!banner.contains("prod\nignore"));
-        assert!(banner.contains("MCP AGENT WRITES DISABLED"));
-
-        let conn = test_connection(false, true);
-        let banner = McpServer::connection_banner(&conn, false);
-        assert!(banner.contains("MCP AGENT WRITES ENABLED"));
+        assert!(banner.contains("WRITE TOOLS REQUIRE"));
         assert!(banner.contains(WRITE_CONFIRMATION_PHRASE));
     }
 }

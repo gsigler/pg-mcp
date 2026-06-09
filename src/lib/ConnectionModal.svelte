@@ -24,7 +24,6 @@
   let password = $state("");
   let ssl = $state(false);
   let readonly = $state(true);
-  let allowAgentWrites = $state(false);
   let redactPii = $state(false);
   let color = $state(COLOR_PALETTE[0]);
   let localTestResult = $state(null);
@@ -48,7 +47,6 @@
       user = conn.user;
       ssl = conn.ssl;
       readonly = conn.readonly;
-      allowAgentWrites = conn.allowAgentWrites ?? false;
       redactPii = conn.redactPii ?? false;
       color = conn.color || COLOR_PALETTE[0];
       password = "";
@@ -68,7 +66,6 @@
       password,
       ssl,
       readonly,
-      allowAgentWrites: readonly ? false : allowAgentWrites,
       redactPii,
       color,
       connectionString: connectionString.trim() || null,
@@ -312,9 +309,6 @@
     <div class="toggle-row">
       <Toggle label="SSL" bind:checked={ssl} />
       <Toggle label="Read-only" bind:checked={readonly} />
-      {#if !readonly}
-        <Toggle label="Allow agent writes" bind:checked={allowAgentWrites} />
-      {/if}
       <Toggle label="Redact PII" bind:checked={redactPii} />
     </div>
 
