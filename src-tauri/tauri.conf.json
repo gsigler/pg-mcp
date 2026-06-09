@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nicosql/tauri/dev/crates/tauri-config-schema/schema.json",
   "productName": "pg-mcp",
   "identifier": "com.pg-mcp.app",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
