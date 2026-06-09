@@ -35,7 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
-      version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -172,8 +171,6 @@ jobs:
       - name: Package macOS artifacts
         if: runner.os == 'macOS'
         shell: bash
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
@@ -182,8 +179,6 @@ jobs:
           tar -czf release-artifacts/pg-mcp_universal.app.tar.gz \
             -C src-tauri/target/universal-apple-darwin/release/bundle/macos \
             pg-mcp.app
-          cp src-tauri/target/universal-apple-darwin/release/pg-mcp \
-            "release-artifacts/pg-mcp_${VERSION}_universal-apple-darwin"
 
       - name: Package Windows artifacts
         if: runner.os == 'Windows'
