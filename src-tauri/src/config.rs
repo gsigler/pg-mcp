@@ -33,6 +33,10 @@ pub struct Connection {
     pub ssl: bool,
     #[serde(default = "default_readonly")]
     pub readonly: bool,
+    /// Extra MCP-side gate for operations that can modify a read-write
+    /// database. Defaults off even when `readonly` is false.
+    #[serde(default)]
+    pub allow_agent_writes: bool,
     /// When true, PII in result rows is replaced with `[REDACTED]`
     /// before the MCP response is sent back — so the LLM on the other
     /// side of the pipe never sees the raw values.
@@ -56,6 +60,7 @@ impl Connection {
             "user": self.user,
             "ssl": self.ssl,
             "readonly": self.readonly,
+            "allow_agent_writes": self.allow_agent_writes,
             "redact_pii": self.redact_pii,
             "color": self.color,
         })
@@ -281,6 +286,7 @@ pub struct SafeConnection {
     pub password_set: bool,
     pub ssl: bool,
     pub readonly: bool,
+    pub allow_agent_writes: bool,
     pub redact_pii: bool,
     pub color: String,
     pub connection_string_set: bool,
@@ -297,6 +303,7 @@ impl From<&Connection> for SafeConnection {
             password_set: !c.password.is_empty(),
             ssl: c.ssl,
             readonly: c.readonly,
+            allow_agent_writes: c.allow_agent_writes,
             redact_pii: c.redact_pii,
             color: c.color.clone(),
             connection_string_set: c.connection_string.is_some(),

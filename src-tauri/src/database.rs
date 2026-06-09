@@ -163,6 +163,7 @@ impl DatabaseManager {
                 "ssl": conn.ssl,
                 "readonly": conn.readonly,
                 "observed_readonly": observed,
+                "allow_agent_writes": conn.allow_agent_writes,
                 "redact_pii": conn.redact_pii,
             }),
         );

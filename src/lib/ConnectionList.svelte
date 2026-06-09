@@ -37,7 +37,7 @@
         </div>
 
         <span class="mode-badge" class:ro={conn.readonly} class:rw={!conn.readonly}>
-          {conn.readonly ? "RO" : "RW"}
+          {conn.readonly ? "RO" : conn.allowAgentWrites ? "RW+" : "RW"}
         </span>
 
         <span
