@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio_postgres::config::SslMode;
+use tokio_postgres::error::{DbError, ErrorPosition};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config as PgConfig, Error as PgError, NoTls, Row};
 
@@ -2300,9 +2301,78 @@ fn redact_sql_literals(sql: &str) -> String {
 fn format_pg_error(context: &str, err: &PgError, connection_lost: bool) -> String {
     if connection_lost || pg_error_indicates_connection_lost(err) {
         format!("{}: database connection lost ({})", context, err)
+    } else if let Some(db_err) = err.as_db_error() {
+        format_pg_db_error(context, db_err)
     } else {
         format!("{}: {}", context, err)
     }
+}
+
+fn format_pg_db_error(context: &str, err: &DbError) -> String {
+    let position = err.position().map(format_error_position);
+    let object_fields = [
+        ("Schema", err.schema()),
+        ("Table", err.table()),
+        ("Column", err.column()),
+        ("Data type", err.datatype()),
+        ("Constraint", err.constraint()),
+    ];
+
+    format_pg_error_details(
+        context,
+        err.code().code(),
+        err.message(),
+        err.detail(),
+        err.hint(),
+        position.as_deref(),
+        err.where_(),
+        object_fields
+            .iter()
+            .filter_map(|(label, value)| value.map(|value| (*label, value))),
+    )
+}
+
+fn format_error_position(position: &ErrorPosition) -> String {
+    match position {
+        ErrorPosition::Original(position) => format!("Position: byte {}", position),
+        ErrorPosition::Internal { position, query } => {
+            format!(
+                "Position: byte {} in internally generated query: {}",
+                position, query
+            )
+        }
+    }
+}
+
+fn format_pg_error_details<'a>(
+    context: &str,
+    code: &str,
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+    position: Option<&str>,
+    where_: Option<&str>,
+    object_fields: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut lines = vec![format!("{}: {} (SQLSTATE {})", context, message, code)];
+
+    if let Some(detail) = detail {
+        lines.push(format!("Detail: {}", detail));
+    }
+    if let Some(hint) = hint {
+        lines.push(format!("Hint: {}", hint));
+    }
+    if let Some(position) = position {
+        lines.push(position.to_string());
+    }
+    if let Some(where_) = where_ {
+        lines.push(format!("Where: {}", where_));
+    }
+    for (label, value) in object_fields {
+        lines.push(format!("{}: {}", label, value));
+    }
+
+    lines.join("\n")
 }
 
 fn pg_error_indicates_connection_lost(err: &PgError) -> bool {
@@ -2432,6 +2502,28 @@ mod tests {
                 msg
             );
         }
+    }
+
+    #[test]
+    fn postgres_error_details_include_actionable_fields() {
+        let formatted = format_pg_error_details(
+            "Query error",
+            "42703",
+            "column cs.delaydays does not exist",
+            Some("There is a column named \"delayDays\" in table \"campaign_steps\"."),
+            Some("Perhaps you meant to reference the column \"cs.delayDays\"."),
+            Some("Position: byte 82"),
+            None,
+            [("Table", "campaign_steps"), ("Column", "delayDays")],
+        );
+
+        assert!(formatted.contains("Query error: column cs.delaydays does not exist"));
+        assert!(formatted.contains("SQLSTATE 42703"));
+        assert!(formatted.contains("Detail: There is a column named"));
+        assert!(formatted.contains("Hint: Perhaps you meant"));
+        assert!(formatted.contains("Position: byte 82"));
+        assert!(formatted.contains("Table: campaign_steps"));
+        assert!(!formatted.contains("db error"));
     }
 
     #[test]
