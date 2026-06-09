@@ -1,5 +1,5 @@
 use crate::config::{Config, Connection};
-use crate::database::{DatabaseManager, MAX_EXPECTED_WRITE_ROWS};
+use crate::database::{DatabaseManager, MAX_EXPECTED_WRITE_ROWS, MAX_QUERY_TIMEOUT_SECONDS};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -113,13 +113,14 @@ impl McpServer {
                     },
                     {
                         "name": "query",
-                        "description": "Executes a SQL query against the active database. Returns results as a formatted text table. Blocked by read-only enforcement if the query is a write operation. Supports pagination with limit/offset.",
+                        "description": "Executes a SQL query against the active database. Returns results as a formatted text table. Blocked by read-only enforcement if the query is a write operation. Supports pagination with limit/offset and optional per-query timeoutSeconds.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "sql": { "type": "string", "description": "The SQL query to execute" },
                                 "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Max rows to return (for pagination). Defaults to 100." },
-                                "offset": { "type": "integer", "minimum": 0, "maximum": 10000000, "description": "Row offset (for pagination). Defaults to 0." }
+                                "offset": { "type": "integer", "minimum": 0, "maximum": 10000000, "description": "Row offset (for pagination). Defaults to 0." },
+                                "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": MAX_QUERY_TIMEOUT_SECONDS, "description": "Optional statement timeout for this query only. Defaults to 30 seconds; capped at 600 seconds." }
                             },
                             "required": ["sql"]
                         }
@@ -528,6 +529,14 @@ impl McpServer {
             .get("offset")
             .and_then(|o| o.as_u64())
             .map(|o| o as usize);
+        let timeout_seconds = match args.get("timeoutSeconds") {
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or("timeoutSeconds must be an integer number of seconds")?,
+            ),
+            None => None,
+        };
 
         let banner = self.banner_for(&conn).await;
         let result = if limit.is_some() || offset.is_some() {
@@ -537,10 +546,13 @@ impl McpServer {
                     conn.readonly,
                     limit.unwrap_or(100),
                     offset.unwrap_or(0),
+                    timeout_seconds,
                 )
                 .await?
         } else {
-            self.db.execute_query(sql, conn.readonly).await?
+            self.db
+                .execute_query(sql, conn.readonly, timeout_seconds)
+                .await?
         };
         Ok(format!("{}\n{}", banner, result))
     }

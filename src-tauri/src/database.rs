@@ -15,6 +15,7 @@ const MAX_COLUMN_WIDTH: usize = 60;
 const MAX_INSERT_ROWS: usize = 100;
 pub const MAX_EXPECTED_WRITE_ROWS: u64 = 100;
 const STATEMENT_TIMEOUT: &str = "30s";
+pub const MAX_QUERY_TIMEOUT_SECONDS: u64 = 600;
 const IDLE_IN_TXN_TIMEOUT: &str = "60s";
 
 /// Best-effort keyword blocklist. This is a UX fast-fail only — real
@@ -291,8 +292,21 @@ impl DatabaseManager {
 
     // ─── Core query execution ──────────────────────────────────────
 
-    pub async fn execute_query(&self, sql: &str, readonly: bool) -> Result<String, String> {
+    pub async fn execute_query(
+        &self,
+        sql: &str,
+        readonly: bool,
+        timeout_seconds: Option<u64>,
+    ) -> Result<String, String> {
         Self::ensure_single_statement(sql)?;
+        Self::validate_query_timeout_seconds(timeout_seconds)?;
+        if timeout_seconds.is_some() && *self.in_transaction.lock().await {
+            return Err(
+                "timeoutSeconds cannot be used inside an active transaction. \
+                 Commit or roll back the transaction, then retry the query."
+                    .into(),
+            );
+        }
         // Fast-fail UX checks. Real enforcement is the startup-options
         // `default_transaction_read_only=on` and the post-query session
         // reset; these errors just produce clearer messages than letting
@@ -320,13 +334,14 @@ impl DatabaseManager {
                     .into(),
             );
         }
-        self.execute_parameterized(sql, &[]).await
+        self.execute_parameterized(sql, &[], timeout_seconds).await
     }
 
     async fn execute_parameterized(
         &self,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
+        timeout_seconds: Option<u64>,
     ) -> Result<String, String> {
         let start = Instant::now();
         let redact = *self.redact_pii.lock().await;
@@ -334,10 +349,25 @@ impl DatabaseManager {
         // Scope the client guard so it's dropped before the post-query
         // reset reacquires the client mutex. `tokio::sync::Mutex` is not
         // reentrant — holding it across the reset call would deadlock.
-        let result = {
+        let (result, restore_error) = {
             let guard = self.get_client().await?;
             let client = guard.as_ref().unwrap();
-            client.query(sql, params).await
+            if let Some(seconds) = timeout_seconds {
+                client
+                    .batch_execute(&statement_timeout_sql(seconds))
+                    .await
+                    .map_err(|e| format_pg_error("Failed to set query timeout", &e, false))?;
+            }
+            let result = client.query(sql, params).await;
+            let restore_error = if timeout_seconds.is_some() {
+                client
+                    .batch_execute(&statement_timeout_sql_default())
+                    .await
+                    .err()
+            } else {
+                None
+            };
+            (result, restore_error)
         };
         let duration_ms = start.elapsed().as_millis();
 
@@ -357,6 +387,10 @@ impl DatabaseManager {
             }
         };
 
+        if let Some(e) = restore_error {
+            log::warn!("[pg-mcp] failed to restore statement_timeout: {}", e);
+            self.disconnect().await;
+        }
         self.reset_if_readonly_outside_txn().await;
         response
     }
@@ -463,8 +497,10 @@ impl DatabaseManager {
         readonly: bool,
         limit: usize,
         offset: usize,
+        timeout_seconds: Option<u64>,
     ) -> Result<String, String> {
         Self::ensure_single_statement(sql)?;
+        Self::validate_query_timeout_seconds(timeout_seconds)?;
         // Clamp to sensible bounds; values are integers so safe to inline.
         let limit = limit.min(10_000);
         let offset = offset.min(10_000_000);
@@ -473,7 +509,9 @@ impl DatabaseManager {
             "SELECT * FROM ({}) AS __pgmcp_paged LIMIT {} OFFSET {}",
             sql, limit, offset
         );
-        let result = self.execute_query(&paginated, readonly).await?;
+        let result = self
+            .execute_query(&paginated, readonly, timeout_seconds)
+            .await?;
         Ok(format!(
             "{}\n(page: offset={}, limit={})\n",
             result, offset, limit
@@ -602,7 +640,7 @@ impl DatabaseManager {
             col_list,
             value_groups.join(", ")
         );
-        self.execute_parameterized(&sql, &[]).await
+        self.execute_parameterized(&sql, &[], None).await
     }
 
     pub async fn update_rows(
@@ -706,7 +744,23 @@ impl DatabaseManager {
             "EXPLAIN"
         };
         let explain_sql = format!("{} {}", prefix, trim_trailing_statement_semicolon(sql));
-        self.execute_parameterized(&explain_sql, &[]).await
+        self.execute_parameterized(&explain_sql, &[], None).await
+    }
+
+    fn validate_query_timeout_seconds(timeout_seconds: Option<u64>) -> Result<(), String> {
+        let Some(seconds) = timeout_seconds else {
+            return Ok(());
+        };
+        if seconds == 0 {
+            return Err("timeoutSeconds must be at least 1.".into());
+        }
+        if seconds > MAX_QUERY_TIMEOUT_SECONDS {
+            return Err(format!(
+                "timeoutSeconds={} exceeds the safety cap of {} seconds.",
+                seconds, MAX_QUERY_TIMEOUT_SECONDS
+            ));
+        }
+        Ok(())
     }
 
     fn validate_expected_max_rows(expected_max_rows: u64) -> Result<(), String> {
@@ -1100,7 +1154,7 @@ impl DatabaseManager {
         let limit = limit.unwrap_or(5).min(50);
         let (schema_q, tbl_q) = parse_qualified(table);
         let sql = format!("SELECT * FROM {}.{} LIMIT {}", schema_q, tbl_q, limit);
-        self.execute_query(&sql, true).await
+        self.execute_query(&sql, true, None).await
     }
 
     pub async fn get_schema_diagram(&self, schema: Option<&str>) -> Result<String, String> {
@@ -1834,6 +1888,14 @@ fn strip_unsupported_url_query_params(cs: &str) -> (String, Vec<String>) {
     (out, dropped)
 }
 
+fn statement_timeout_sql(seconds: u64) -> String {
+    format!("SET statement_timeout = '{}s'", seconds)
+}
+
+fn statement_timeout_sql_default() -> String {
+    format!("SET statement_timeout = '{}'", STATEMENT_TIMEOUT)
+}
+
 /// Apply per-session guardrails after connect:
 /// - application_name: tags the connection in `pg_stat_activity` as
 ///   `pg-mcp/<session-uuid>/<connection-name>` so operators can tell
@@ -2524,6 +2586,28 @@ mod tests {
         assert!(formatted.contains("Position: byte 82"));
         assert!(formatted.contains("Table: campaign_steps"));
         assert!(!formatted.contains("db error"));
+    }
+
+    #[test]
+    fn query_timeout_validation_enforces_bounds() {
+        DatabaseManager::validate_query_timeout_seconds(None).unwrap();
+        DatabaseManager::validate_query_timeout_seconds(Some(1)).unwrap();
+        DatabaseManager::validate_query_timeout_seconds(Some(MAX_QUERY_TIMEOUT_SECONDS)).unwrap();
+
+        assert!(DatabaseManager::validate_query_timeout_seconds(Some(0)).is_err());
+        assert!(DatabaseManager::validate_query_timeout_seconds(Some(
+            MAX_QUERY_TIMEOUT_SECONDS + 1
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn statement_timeout_sql_uses_validated_seconds() {
+        assert_eq!(statement_timeout_sql(120), "SET statement_timeout = '120s'");
+        assert_eq!(
+            statement_timeout_sql_default(),
+            "SET statement_timeout = '30s'"
+        );
     }
 
     #[test]
