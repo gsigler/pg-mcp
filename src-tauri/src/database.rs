@@ -17,6 +17,8 @@ pub const MAX_EXPECTED_WRITE_ROWS: u64 = 100;
 const STATEMENT_TIMEOUT: &str = "30s";
 pub const MAX_QUERY_TIMEOUT_SECONDS: u64 = 600;
 const IDLE_IN_TXN_TIMEOUT: &str = "60s";
+const CONNECTION_RECOVERY_HINT: &str =
+    "Recovery: pg-mcp cleared any stale database session and will reconnect automatically on the next safe tool call. Check network/VPN/database availability, then retry the MCP call. Restarting the pg-mcp UI is not required because MCP clients run their own server process.";
 
 /// Best-effort keyword blocklist. This is a UX fast-fail only — real
 /// readonly enforcement is server-side: `default_transaction_read_only=on`
@@ -1657,28 +1659,24 @@ async fn connect_client(conn: &Connection) -> Result<Client, String> {
             .build()
             .map_err(|e| format!("TLS setup failed: {}", e))?;
         let tls = MakeTlsConnector::new(tls);
-        let (c, h) = cfg.connect(tls).await.map_err(|e| {
-            format!(
-                "Connection failed (TLS): {}",
-                hint_ssl_error(&e.to_string(), conn)
-            )
-        })?;
+        let (c, h) = cfg
+            .connect(tls)
+            .await
+            .map_err(|e| format_connect_error("Connection failed (TLS)", &e, conn))?;
         tokio::spawn(async move {
             if let Err(e) = h.await {
-                log::error!("Connection error: {}", e);
+                log::error!("{}", format_pg_error("Connection error", &e, false));
             }
         });
         c
     } else {
-        let (c, h) = cfg.connect(NoTls).await.map_err(|e| {
-            format!(
-                "Connection failed: {}",
-                hint_ssl_error(&e.to_string(), conn)
-            )
-        })?;
+        let (c, h) = cfg
+            .connect(NoTls)
+            .await
+            .map_err(|e| format_connect_error("Connection failed", &e, conn))?;
         tokio::spawn(async move {
             if let Err(e) = h.await {
-                log::error!("Connection error: {}", e);
+                log::error!("{}", format_pg_error("Connection error", &e, false));
             }
         });
         c
@@ -1707,6 +1705,10 @@ fn hint_ssl_error(msg: &str, conn: &Connection) -> String {
     } else {
         msg.to_string()
     }
+}
+
+fn format_connect_error(context: &str, err: &PgError, conn: &Connection) -> String {
+    hint_ssl_error(&format_pg_error(context, err, false), conn)
 }
 
 /// Build the `tokio_postgres::Config` we'll connect with. Either parses
@@ -2362,12 +2364,43 @@ fn redact_sql_literals(sql: &str) -> String {
 
 fn format_pg_error(context: &str, err: &PgError, connection_lost: bool) -> String {
     if connection_lost || pg_error_indicates_connection_lost(err) {
-        format!("{}: database connection lost ({})", context, err)
+        format_pg_connection_lost_error(context, err)
     } else if let Some(db_err) = err.as_db_error() {
         format_pg_db_error(context, db_err)
     } else {
         format!("{}: {}", context, err)
     }
+}
+
+fn format_pg_connection_lost_error(context: &str, err: &PgError) -> String {
+    let mut text = if let Some(db_err) = err.as_db_error() {
+        let position = db_err.position().map(format_error_position);
+        let object_fields = [
+            ("Schema", db_err.schema()),
+            ("Table", db_err.table()),
+            ("Column", db_err.column()),
+            ("Data type", db_err.datatype()),
+            ("Constraint", db_err.constraint()),
+        ];
+        let context = format!("{}: database connection lost", context);
+        format_pg_error_details(
+            &context,
+            db_err.code().code(),
+            db_err.message(),
+            db_err.detail(),
+            db_err.hint(),
+            position.as_deref(),
+            db_err.where_(),
+            object_fields
+                .iter()
+                .filter_map(|(label, value)| value.map(|value| (*label, value))),
+        )
+    } else {
+        format!("{}: database connection lost ({})", context, err)
+    };
+    text.push('\n');
+    text.push_str(CONNECTION_RECOVERY_HINT);
+    text
 }
 
 fn format_pg_db_error(context: &str, err: &DbError) -> String {
@@ -2550,6 +2583,7 @@ mod tests {
             "server closed the connection unexpectedly",
             "Connection reset by peer",
             "write failed: Broken pipe",
+            "Query error: database connection lost (db error)",
         ] {
             assert!(is_connection_closed_message(msg), "should match: {}", msg);
         }
