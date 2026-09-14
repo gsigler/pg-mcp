@@ -1,8 +1,8 @@
 <script>
-  let { label, checked = $bindable(false) } = $props();
+  let { label, checked = $bindable(false), title = "" } = $props();
 </script>
 
-<label class="toggle-label">
+<label class="toggle-label" {title}>
   <span>{label}</span>
   <button
     type="button"

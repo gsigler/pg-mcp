@@ -1642,71 +1642,174 @@ impl DatabaseManager {
 
 // ─── Connection helpers ─────────────────────────────────────────────
 
+/// How we'll speak TLS to Postgres. Mirrors libpq `sslmode`, which is
+/// also TablePlus's default (`prefer`): try encryption, don't require a
+/// custom CA, fall back to plaintext if the server doesn't offer SSL.
+/// The UI SSL toggle is the *verify* switch, not "whether to encrypt".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsPolicy {
+    Disable,
+    Prefer,
+    Require,
+    Verify,
+}
+
 async fn connect_client(conn: &Connection) -> Result<Client, String> {
-    let cfg = build_connect_config(conn)?;
+    let mut cfg = build_connect_config(conn)?;
+    let policy = tls_policy(conn, cfg.get_ssl_mode());
+    match policy {
+        TlsPolicy::Disable => {
+            cfg.ssl_mode(SslMode::Disable);
+        }
+        TlsPolicy::Prefer => {
+            cfg.ssl_mode(SslMode::Prefer);
+        }
+        TlsPolicy::Require | TlsPolicy::Verify => {
+            cfg.ssl_mode(SslMode::Require);
+        }
+    }
 
-    // Attempt TLS whenever the UI toggle is on *or* the parsed sslmode
-    // demands it. The second half matters for hosted Postgres like AWS
-    // RDS: users often paste a `postgresql://…?sslmode=require` URL
-    // without flipping the SSL toggle, and tokio-postgres rejects
-    // `Require` + NoTls with a terse "no tls" error.
-    let use_tls = conn.ssl || cfg.get_ssl_mode() == SslMode::Require;
+    let fail = |prefix: &str, e: &PgError| {
+        let raw = format_pg_error(prefix, e, false);
+        let msg = hint_ssl_error(&raw, policy);
+        audit_connect_failure(conn, &msg);
+        msg
+    };
 
-    let client = if use_tls {
-        let tls = TlsConnector::builder()
-            .build()
-            .map_err(|e| format!("TLS setup failed: {}", e))?;
-        let tls = MakeTlsConnector::new(tls);
-        let (c, h) = cfg.connect(tls).await.map_err(|e| {
-            format!(
-                "Connection failed (TLS): {}",
-                hint_ssl_error(&e.to_string(), conn)
-            )
-        })?;
-        tokio::spawn(async move {
-            if let Err(e) = h.await {
-                log::error!("Connection error: {}", e);
-            }
-        });
-        c
-    } else {
-        let (c, h) = cfg.connect(NoTls).await.map_err(|e| {
-            format!(
-                "Connection failed: {}",
-                hint_ssl_error(&e.to_string(), conn)
-            )
-        })?;
-        tokio::spawn(async move {
-            if let Err(e) = h.await {
-                log::error!("Connection error: {}", e);
-            }
-        });
-        c
+    let client = match policy {
+        TlsPolicy::Disable => {
+            let (c, h) = cfg
+                .connect(NoTls)
+                .await
+                .map_err(|e| fail("Connection failed", &e))?;
+            spawn_backend(h);
+            c
+        }
+        TlsPolicy::Prefer | TlsPolicy::Require => {
+            let tls = make_tls_connector(false)?;
+            let (c, h) = cfg
+                .connect(tls)
+                .await
+                .map_err(|e| fail("Connection failed (TLS)", &e))?;
+            spawn_backend(h);
+            c
+        }
+        TlsPolicy::Verify => {
+            let tls = make_tls_connector(true)?;
+            let (c, h) = cfg
+                .connect(tls)
+                .await
+                .map_err(|e| fail("Connection failed (TLS)", &e))?;
+            spawn_backend(h);
+            c
+        }
     };
 
     Ok(client)
 }
 
-/// Append an actionable hint when the underlying error is the classic
-/// "server requires SSL but the client didn't offer it" shape. Hosted
-/// Postgres (AWS RDS, GCP Cloud SQL, Azure) rejects plaintext with this
-/// error and new users have no way to know the UI SSL toggle is the fix.
-fn hint_ssl_error(msg: &str, conn: &Connection) -> String {
+fn tls_policy(conn: &Connection, parsed_ssl_mode: SslMode) -> TlsPolicy {
+    if conn.ssl || connection_string_requests_verify(conn.connection_string.as_deref()) {
+        return TlsPolicy::Verify;
+    }
+    match parsed_ssl_mode {
+        SslMode::Disable => TlsPolicy::Disable,
+        SslMode::Require => TlsPolicy::Require,
+        _ => TlsPolicy::Prefer,
+    }
+}
+
+/// `sslmode=verify-ca` / `verify-full` in a pasted URL. We rewrite those
+/// to `require` before tokio-postgres parses the string, so this has to
+/// look at the original text.
+fn connection_string_requests_verify(cs: Option<&str>) -> bool {
+    let Some(cs) = cs else {
+        return false;
+    };
+    sslmode_value(cs).is_some_and(|v| v == "verify-ca" || v == "verify-full")
+}
+
+fn sslmode_value(cs: &str) -> Option<String> {
+    let lower = cs.to_ascii_lowercase();
+    let key = "sslmode=";
+    let rel = lower.find(key)?;
+    let value_start = rel + key.len();
+    let value_end = cs[value_start..]
+        .find(|c: char| c == ' ' || c == '\t' || c == '&' || c == '\n' || c == '\r')
+        .map(|p| value_start + p)
+        .unwrap_or(cs.len());
+    Some(cs[value_start..value_end].to_ascii_lowercase())
+}
+
+fn make_tls_connector(verify: bool) -> Result<MakeTlsConnector, String> {
+    let mut builder = TlsConnector::builder();
+    if !verify {
+        // libpq `prefer` / `require` encrypt without trusting a CA.
+        // AWS RDS uses a regional root that is not in the OS store, so
+        // verified TLS fails even though TablePlus/`psql` connect fine.
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+    }
+    let tls = builder
+        .build()
+        .map_err(|e| format!("TLS setup failed: {}", e))?;
+    Ok(MakeTlsConnector::new(tls))
+}
+
+fn spawn_backend<F>(handle: F)
+where
+    F: std::future::Future<Output = Result<(), PgError>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            log::error!("Connection error: {}", e);
+        }
+    });
+}
+
+fn audit_connect_failure(conn: &Connection, err: &str) {
+    crate::audit::log(
+        "connection_failed",
+        serde_json::json!({
+            "connection": conn.name,
+            "host": conn.host,
+            "database": conn.database,
+            "ssl": conn.ssl,
+            "error": truncate_for_log(err, 500),
+        }),
+    );
+}
+
+/// Extra guidance when the driver error is one we can map to a toggle.
+fn hint_ssl_error(msg: &str, policy: TlsPolicy) -> String {
     let lower = msg.to_ascii_lowercase();
     let looks_like_ssl_required = lower.contains("no encryption")
         || lower.contains("ssl connection is required")
         || lower.contains("ssl off")
         || lower.contains("no tls")
         || lower.contains("no pg_hba.conf entry");
-    if looks_like_ssl_required && !conn.ssl {
-        format!(
-            "{msg}\n\nThis server appears to require SSL. Enable the SSL \
-             toggle on this connection (or add `sslmode=require` to your \
-             connection string) and try again."
-        )
-    } else {
-        msg.to_string()
+    if looks_like_ssl_required && policy == TlsPolicy::Disable {
+        return format!(
+            "{msg}\n\nThis server requires SSL. Remove `sslmode=disable` \
+             from the connection string so pg-mcp can negotiate TLS \
+             automatically."
+        );
     }
+    let looks_like_cert = lower.contains("certificate")
+        || lower.contains("unknown issuer")
+        || lower.contains("self signed")
+        || lower.contains("self-signed")
+        || lower.contains("cert");
+    if looks_like_cert && policy == TlsPolicy::Verify {
+        return format!(
+            "{msg}\n\nThe server certificate isn't in the OS trust store \
+             (common with AWS RDS). Turn the SSL toggle off to encrypt \
+             without verifying the CA — the same default TablePlus uses \
+             — or import the RDS CA bundle into Keychain / Certificate \
+             Manager."
+        );
+    }
+    msg.to_string()
 }
 
 /// Build the `tokio_postgres::Config` we'll connect with. Either parses
@@ -1727,9 +1830,9 @@ fn build_connect_config(conn: &Connection) -> Result<PgConfig, String> {
         // AWS RDS docs and the `psql` CLI commonly use `sslmode=verify-ca`
         // or `sslmode=verify-full`, but tokio-postgres 0.7 only accepts
         // `disable|prefer|require`. Rewrite the stricter modes to
-        // `require` before parsing — `native-tls` already performs full
-        // CA + hostname verification by default, so the effective
-        // security level is unchanged.
+        // `require` before parsing. Certificate verification is decided
+        // separately by `tls_policy` (UI SSL toggle, or the original
+        // verify-* value on the URL).
         let normalized = normalize_sslmode_param(cs);
         let (normalized, dropped) = strip_unsupported_url_query_params(&normalized);
         if !dropped.is_empty() {
@@ -1777,10 +1880,8 @@ fn build_connect_config(conn: &Connection) -> Result<PgConfig, String> {
 /// Rewrite `sslmode=verify-ca` / `sslmode=verify-full` to `sslmode=require`
 /// inside a connection string, leaving everything else untouched.
 /// tokio-postgres 0.7 only accepts `disable|prefer|require` and rejects
-/// the verify-* variants with an "Invalid value" error, even though
-/// AWS RDS and the libpq CLI treat them as the canonical "secure" modes.
-/// `native-tls` already performs full CA + hostname verification by
-/// default, so mapping to `require` preserves the user's intent.
+/// the verify-* variants with an "Invalid value" error. Verification is
+/// applied later by `tls_policy` based on the original URL / SSL toggle.
 fn normalize_sslmode_param(cs: &str) -> String {
     let lower = cs.to_ascii_lowercase();
     let key = "sslmode=";
@@ -2608,6 +2709,78 @@ mod tests {
             statement_timeout_sql_default(),
             "SET statement_timeout = '30s'"
         );
+    }
+
+    fn test_conn(ssl: bool, cs: Option<&str>) -> Connection {
+        Connection {
+            name: "t".into(),
+            host: "localhost".into(),
+            port: 5432,
+            database: "db".into(),
+            user: "u".into(),
+            password: String::new(),
+            ssl,
+            readonly: true,
+            redact_pii: false,
+            color: String::new(),
+            connection_string: cs.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn tls_policy_defaults_to_prefer_like_tableplus() {
+        let conn = test_conn(false, None);
+        assert_eq!(tls_policy(&conn, SslMode::Prefer), TlsPolicy::Prefer);
+    }
+
+    #[test]
+    fn tls_policy_ssl_toggle_verifies() {
+        let conn = test_conn(true, None);
+        assert_eq!(tls_policy(&conn, SslMode::Prefer), TlsPolicy::Verify);
+    }
+
+    #[test]
+    fn tls_policy_honors_sslmode_disable() {
+        let conn = test_conn(false, Some("postgresql://u@h/d?sslmode=disable"));
+        assert_eq!(tls_policy(&conn, SslMode::Disable), TlsPolicy::Disable);
+    }
+
+    #[test]
+    fn tls_policy_require_without_toggle_does_not_verify() {
+        let conn = test_conn(false, Some("postgresql://u@h/d?sslmode=require"));
+        assert_eq!(tls_policy(&conn, SslMode::Require), TlsPolicy::Require);
+    }
+
+    #[test]
+    fn tls_policy_verify_full_url_still_verifies_after_rewrite() {
+        let conn = test_conn(
+            false,
+            Some("postgresql://u@h/d?sslmode=verify-full"),
+        );
+        // tokio-postgres sees `require` after normalize_sslmode_param.
+        assert_eq!(tls_policy(&conn, SslMode::Require), TlsPolicy::Verify);
+        assert!(connection_string_requests_verify(
+            conn.connection_string.as_deref()
+        ));
+    }
+
+    #[test]
+    fn hint_ssl_error_explains_disable_against_force_ssl() {
+        let msg = hint_ssl_error(
+            "Connection failed: no pg_hba.conf entry for host \"1.2.3.4\", no encryption",
+            TlsPolicy::Disable,
+        );
+        assert!(msg.contains("Remove `sslmode=disable`"));
+    }
+
+    #[test]
+    fn hint_ssl_error_explains_untrusted_rds_ca() {
+        let msg = hint_ssl_error(
+            "Connection failed (TLS): invalid peer certificate: UnknownIssuer",
+            TlsPolicy::Verify,
+        );
+        assert!(msg.contains("Turn the SSL toggle off"));
+        assert!(msg.contains("RDS"));
     }
 
     #[test]
