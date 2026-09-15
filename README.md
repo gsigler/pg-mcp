@@ -12,7 +12,7 @@ It is a small desktop app for managing database connections plus an MCP server t
 - **Destructive writes have a row cap.** `update_rows` and `delete_rows` require `expected_max_rows` so a bad filter can be rolled back before it does too much damage.
 - **PII can be redacted.** A per-connection toggle hides cells that look like emails, phone numbers, SSNs, credit-card-like values, or name-ish fields.
 - **Every query is auditable.** The local audit log records agent queries with session IDs.
-- **Remote databases can use TLS.** Turn on SSL for encrypted Postgres connections.
+- **TLS is automatic.** Connections encrypt when the server offers SSL (the same default as TablePlus / `psql`). Turn the SSL toggle on only if you want the server certificate verified.
 
 ## Install
 
@@ -71,7 +71,7 @@ pg-mcp gives agents practical Postgres tools without making them memorize your s
 
 - Use a least-privilege Postgres role instead of a superuser.
 - Prefer read-only roles or read replicas for agent analysis work.
-- Turn on SSL for remote databases.
+- SSL is negotiated automatically. Use the SSL toggle only when you want certificate verification.
 - Rotate credentials in your normal password or cloud-secret workflow.
 
 pg-mcp adds helpful guardrails, but Postgres permissions are still the source of truth.

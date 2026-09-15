@@ -179,10 +179,9 @@
       params = new URLSearchParams();
     }
     const sslmodeRaw = (params.get("sslmode") || "").toLowerCase();
-    const wantsSsl =
-      sslmodeRaw === "require" ||
-      sslmodeRaw === "verify-ca" ||
-      sslmodeRaw === "verify-full";
+    // Only verify-* flips the SSL toggle. `require`/`prefer` encrypt
+    // without CA verification — the same default as TablePlus / libpq.
+    const wantsSsl = sslmodeRaw === "verify-ca" || sslmodeRaw === "verify-full";
 
     const safeDecode = (s) => {
       if (!s) return "";
@@ -307,7 +306,11 @@
     </div>
 
     <div class="toggle-row">
-      <Toggle label="SSL" bind:checked={ssl} />
+      <Toggle
+        label="SSL"
+        bind:checked={ssl}
+        title="Off: encrypt if the server supports it (like TablePlus). On: require TLS and verify the certificate."
+      />
       <Toggle label="Read-only" bind:checked={readonly} />
       <Toggle label="Redact PII" bind:checked={redactPii} />
     </div>
